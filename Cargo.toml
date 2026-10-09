@@ -1,0 +1,13 @@
+[package]
+name = "argus-ledger"
+version = "0.1.0-alpha.1"
+edition = "2021"
+authors = ["Perseus Computing LLC <contact@perseuscomputing.com>"]
+description = "Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents."
+license = "MIT"
+repository = "https://github.com/Perseus-Computing-LLC/argus"
+readme = "README.md"
+keywords = ["ai", "agents", "cognitive", "perseus"]
+categories = ["development-tools"]
+
+[dependencies]

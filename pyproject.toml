@@ -8,7 +8,7 @@ version = "0.1.0a1"
 description = "Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents."
 readme = "README.md"
 authors = [
-    { name = "Perseus Computing LLC", email = "tcconnally@gmail.com" }
+    { name = "Perseus Computing LLC", email = "contact@perseuscomputing.com" }
 ]
 license = { text = "MIT" }
 classifiers = [
