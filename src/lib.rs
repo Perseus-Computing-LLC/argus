@@ -1,47 +1,133 @@
 //! # argus-ledger
 //!
 //! Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents.
-//! Clean-room implementation © 2026 Perseus Computing LLC.
+//!
+//! When autonomous agents execute commands, invoke external APIs, or mutate persistent
+//! memory, post-incident investigations require cryptographic certainty regarding what
+//! actions occurred and in what sequence. Standard application logs can be rewritten,
+//! reordered, or truncated.
+//!
+//! Argus provides an immutable append-only hash chain where each event records:
+//!
+//! 1. A strictly sequential sequence integer.
+//! 2. A cryptographic digest binding the payload to the previous event's hash (`prev_hash`).
+//! 3. Deterministic chain verification that validates integrity in linear time.
+//!
+//! ## Architecture Overview
+//!
+//! - [`AuditEvent`]: The individual structured log record containing event metadata,
+//!   payload, monotonic sequence number, and SHA-256 digests.
+//! - [`ChainVerificationReport`]: Audit summary produced by traversing the hash chain
+//!   from genesis to head, validating sequence ordering and hash consistency.
+//! - [`AuditLedgerWriter`]: Trait for appending new events to the audit log.
+//! - [`AuditLedgerReader`]: Trait for querying events by sequence or reading the chain head.
+//! - [`AuditVerifier`]: Trait for verifying cryptographic integrity across the chain.
+//! - [`InMemoryLedger`]: Thread-safe reference ledger implementation.
+//!
+//! ## Quick Start
+//!
+//! ```rust
+//! use argus_ledger::{AuditLedgerReader, AuditLedgerWriter, AuditVerifier, InMemoryLedger, GENESIS_PREV_HASH};
+//!
+//! // Create an in-memory audit ledger
+//! let mut ledger = InMemoryLedger::new();
+//!
+//! // 1. Record an initial initialization event
+//! let ev1 = ledger.append("agent.startup", "coordinator", "{\"status\":\"initialized\"}")
+//!     .expect("First event must succeed");
+//! assert_eq!(ev1.sequence, 1);
+//! assert_eq!(ev1.prev_hash, GENESIS_PREV_HASH);
+//!
+//! // 2. Record a tool call event cryptographically chained to ev1
+//! let ev2 = ledger.append("tool.exec", "worker_1", "{\"command\":\"build\"}")
+//!     .expect("Second event must succeed");
+//! assert_eq!(ev2.sequence, 2);
+//! assert_eq!(ev2.prev_hash, ev1.event_hash);
+//!
+//! // 3. Verify cryptographic chain integrity
+//! let report = ledger.verify_chain().expect("Verification must complete");
+//! assert!(report.valid);
+//! assert_eq!(report.total_events, 2);
+//! assert_eq!(report.head_hash, ev2.event_hash);
+//! ```
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The fixed 64-character hexadecimal previous hash for genesis events.
 pub const GENESIS_PREV_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// An immutable event record committed to the audit chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
+    /// Monotonically increasing sequence number starting at 1.
     pub sequence: u64,
+    /// Unique event identifier string.
     pub event_id: String,
+    /// Event timestamp in seconds since UNIX epoch.
     pub timestamp: String,
+    /// Dot-separated action taxonomy (for example: agent.startup, tool.exec).
     pub event_type: String,
+    /// Process, user, or subagent identity that triggered the action.
     pub actor: String,
-    pub payload: String, // Canonical JSON payload
+    /// Canonical JSON payload representing the event inputs and parameters.
+    pub payload: String,
+    /// The event_hash of sequence - 1, or GENESIS_PREV_HASH for sequence 1.
     pub prev_hash: String,
+    /// SHA-256 hexadecimal hash computed across the event header and payload.
     pub event_hash: String,
+    /// Optional detached cryptographic signature verifying author authenticity.
     pub signature: Option<String>,
 }
 
+/// Cryptographic integrity verification report for an event chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainVerificationReport {
+    /// True if all sequence numbers, previous hashes, and event hashes match expectations.
     pub valid: bool,
+    /// Total count of events verified in the ledger.
     pub total_events: usize,
+    /// Event hash of the genesis event (sequence 1).
     pub root_hash: String,
+    /// Event hash of the most recent event in the ledger.
     pub head_hash: String,
+    /// Sequence number of the first detected discrepancy, or None if valid.
     pub first_broken_sequence: Option<u64>,
+    /// Human-readable explanation of detected tampering or discontinuity.
     pub error_detail: Option<String>,
+    /// Timestamp when verification was completed in seconds since UNIX epoch.
     pub checked_at: String,
 }
 
+/// Errors returned during ledger append, retrieval, or verification operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LedgerError {
+    /// Event sequence numbers are missing or out of order.
     SequenceDiscontinuity(String),
+    /// Computed event hash does not match recorded event hash.
     HashMismatch(String),
+    /// Mutex lock contention or thread synchronization failure.
     LockError(String),
 }
 
+impl std::fmt::Display for LedgerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SequenceDiscontinuity(msg) => write!(f, "Sequence discontinuity: {}", msg),
+            Self::HashMismatch(msg) => write!(f, "Hash mismatch: {}", msg),
+            Self::LockError(msg) => write!(f, "Lock error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for LedgerError {}
+
+/// Trait defining append operations for audit ledgers.
 pub trait AuditLedgerWriter: Send + Sync {
+    /// Cryptographically append a new action record to the ledger.
     fn append(
         &mut self,
         event_type: &str,
@@ -50,13 +136,19 @@ pub trait AuditLedgerWriter: Send + Sync {
     ) -> Result<AuditEvent, LedgerError>;
 }
 
+/// Trait defining read and query operations for audit ledgers.
 pub trait AuditLedgerReader: Send + Sync {
+    /// Fetch an individual event by its 1-indexed sequence number.
     fn get_event(&self, sequence: u64) -> Result<Option<AuditEvent>, LedgerError>;
+    /// Retrieve the most recently committed event from the head of the chain.
     fn head(&self) -> Result<Option<AuditEvent>, LedgerError>;
+    /// Return an in-order snapshot of all events committed to the ledger.
     fn all_events(&self) -> Result<Vec<AuditEvent>, LedgerError>;
 }
 
+/// Trait defining full-chain cryptographic audit verification.
 pub trait AuditVerifier: Send + Sync {
+    /// Traverse the ledger from genesis to head, verifying all hashes and sequence numbers.
     fn verify_chain(&self) -> Result<ChainVerificationReport, LedgerError>;
 }
 
@@ -155,6 +247,7 @@ pub fn sha256_hex(input: &[u8]) -> String {
     result
 }
 
+/// Compute the canonical SHA-256 event hash across all event metadata and payload fields.
 pub fn compute_event_hash(
     sequence: u64,
     event_id: &str,
@@ -171,12 +264,14 @@ pub fn compute_event_hash(
     sha256_hex(header.as_bytes())
 }
 
+/// Thread-safe in-memory reference implementation of an append-only audit ledger.
 #[derive(Default, Clone)]
 pub struct InMemoryLedger {
     events: Arc<Mutex<Vec<AuditEvent>>>,
 }
 
 impl InMemoryLedger {
+    /// Construct a new empty in-memory audit ledger.
     pub fn new() -> Self {
         Self::default()
     }
@@ -358,7 +453,6 @@ mod tests {
 
     #[test]
     fn test_sha256_known_vector() {
-        // Known test vector: "abc" -> ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"

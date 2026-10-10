@@ -34,7 +34,7 @@ Add `argus-ledger` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-argus-ledger = "0.1.0-alpha.1"
+argus-ledger = "0.1.0-alpha.2"
 ```
 
 Or via Cargo:
