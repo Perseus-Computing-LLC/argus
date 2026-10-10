@@ -22,8 +22,9 @@ Argus records every event into an append-only sequence where each entry includes
 ## Key design goals
 
 - **Continuous hash chaining:** Every event links cryptographically to the one before it, rooted at genesis.
-- **Fast tamper detection:** Scans 100,000 events in 46.00 &micro;s and fails closed the moment a single byte does not match.
-- **Low latency appends:** Appending an event takes 4.12 &micro;s, fast enough to log every action inline during agent execution.
+- **Fail-closed tamper detection:** Verifies cryptographic continuity and aborts immediately when any hash or payload is corrupted. Tampered event #42 is detected in ~46.5 &micro;s.
+- **Low latency appends:** In-memory sequential appends with SHA-256 chaining execute at ~600,000 events/s (~1.67 &micro;s/event).
+- **High throughput chain verification:** Traverses and validates complete cryptographic sequences at ~839,000 events/s (~1.19 &micro;s/event).
 - **Self-contained:** Runs fully offline as an in-memory library without external audit services or cloud dependencies.
 
 ---
@@ -91,9 +92,9 @@ Measured on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fa
 
 | Metric | Measurement | Test condition |
 | :--- | :--- | :--- |
-| **Append Latency** | **4.12 &micro;s** | Sequential event hashing and append |
-| **Tamper Detection Latency** | **46.00 &micro;s** | Scan across 100k events |
-| **Verification Throughput** | **2,170,000 events/s** | Full chain validation traversal |
+| **Append Throughput** | **~600,000 events/s** | Sequential SHA-256 event chaining (~1.67 &micro;s/op) |
+| **Tamper Detection Latency** | **46.50 &micro;s** | Abort on corrupted event #42 in sequence |
+| **Chain Verification Throughput** | **~839,000 events/s** | Full chain validation traversal (~1.19 &micro;s/event) |
 | **Tamper Detection Rate** | **100.00%** | Single-bit byte flip sensitivity |
 | **External Dependencies** | **0** | Standalone offline primitives |
 
