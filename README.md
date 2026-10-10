@@ -1,30 +1,30 @@
 # argus-ledger
 
-> Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents.
+> Append-only SHA-256 audit log for autonomous agents.
 
 [![Crates.io](https://img.shields.io/crates/v/argus-ledger.svg)](https://crates.io/crates/argus-ledger)
 [![docs.rs](https://docs.rs/argus-ledger/badge.svg)](https://docs.rs/argus-ledger)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-informational.svg)](Cargo.toml)
 
-Part of the **Perseus Cognitive Infrastructure** suite by [Perseus Computing LLC](https://github.com/Perseus-Computing-LLC).
+Part of the **Perseus** suite by [Perseus Computing LLC](https://github.com/Perseus-Computing-LLC).
 
 ---
 
-## Overview
+## Why Argus exists
 
-`argus-ledger` provides high-assurance, tamper-evident cryptographic provenance for autonomous agent executions. When AI agents make autonomous decisions, execute shell tools, or mutate internal state, retrospective auditability is required to verify system integrity and establish non-repudiation.
+When autonomous agents run shell commands, call APIs, or mutate files, you need a reliable record of what happened and proof that logs were not changed after the fact.
 
-`argus-ledger` records every action into an append-only, SHA-256 hash-chained sequence. Any post-hoc mutation or truncation invalidates the cryptographic continuity and triggers a fail-closed verification fault.
+Argus records every event into an append-only sequence where each entry includes the SHA-256 hash of the previous record. If any entry is altered or deleted, verification fails immediately and points directly to the modified index.
 
 ---
 
-## Architectural Invariants
+## Key design goals
 
-- **Cryptographic Continuity:** Each recorded event embeds the SHA-256 digest of its predecessor, forming an immutable hash chain rooted at genesis.
-- **Fail-Closed Verification:** Detects bit-level tampering across 100,000 events in 46.00 &micro;s, immediately reporting the exact sequence failure index.
-- **Microsecond Event Appends:** 4.12 &micro;s append latency ensures full provenance logging can run inline on every agent turn.
-- **Zero Cloud Oracle Requirements:** Offline Merkle tree validation functions entirely in air-gapped and disconnected environments.
+- **Continuous hash chaining:** Every event links cryptographically to the one before it, rooted at genesis.
+- **Fast tamper detection:** Scans 100,000 events in 46.00 &micro;s and fails closed the moment a single byte does not match.
+- **Low latency appends:** Appending an event takes 4.12 &micro;s, fast enough to log every action inline during agent execution.
+- **Self-contained:** Pure Rust that runs fully offline without external audit services or cloud dependencies.
 
 ---
 
@@ -37,7 +37,7 @@ Add `argus-ledger` to your `Cargo.toml`:
 argus-ledger = "0.1.0-alpha.1"
 ```
 
-Or via Cargo CLI:
+Or via Cargo:
 
 ```bash
 cargo add argus-ledger
@@ -45,7 +45,7 @@ cargo add argus-ledger
 
 ---
 
-## Usage Example
+## Example
 
 ```rust
 use argus_ledger::{
@@ -55,7 +55,7 @@ use argus_ledger::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ledger = InMemoryLedger::new();
 
-    // 1. Record agent initialization event
+    // 1. Record agent startup
     let ev1 = ledger.append(
         "AGENT_BOOTSTRAP",
         "runtime:node_0",
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("Sequence #{}: Hash {}", ev1.sequence, &ev1.event_hash[0..16]);
 
-    // 2. Record tool invocation decision
+    // 2. Record tool execution
     let ev2 = ledger.append(
         "TOOL_INVOCATION",
         "runtime:node_0",
@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("Sequence #{}: Hash {}", ev2.sequence, &ev2.event_hash[0..16]);
 
-    // 3. Verify complete cryptographic integrity
+    // 3. Verify cryptographic integrity
     let report = ledger.verify_chain()?;
     assert!(report.valid, "Chain integrity compromised");
     println!(
@@ -85,19 +85,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Empirical Benchmarks
+## Benchmark results
 
-Evaluated on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fat"`):
+Measured on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fat"`):
 
-| Metric | Measurement | Condition |
+| Metric | Measurement | Test condition |
 | :--- | :--- | :--- |
-| **Append Latency** | **4.12 &micro;s** | Sequential event hashing and commit |
-| **Tamper Detection Latency** | **46.00 &micro;s** | Fail-closed scan across 100k blocks |
-| **Verification Throughput** | **2,170,000 events/s** | Full chain cryptographic traversal |
+| **Append Latency** | **4.12 &micro;s** | Sequential event hashing and append |
+| **Tamper Detection Latency** | **46.00 &micro;s** | Scan across 100k events |
+| **Verification Throughput** | **2,170,000 events/s** | Full chain validation traversal |
 | **Tamper Detection Rate** | **100.00%** | Single-bit byte flip sensitivity |
-| **External Dependencies** | **0** | Pure Rust offline cryptographic primitives |
+| **External Dependencies** | **0** | Pure Rust offline primitives |
 
-Run benchmarks locally:
+Run benchmarks yourself:
 
 ```bash
 cargo run --release -p perseus-benchmarks
@@ -107,4 +107,4 @@ cargo run --release -p perseus-benchmarks
 
 ## License
 
-Clean-room implementation &copy; 2026 Perseus Computing LLC. Licensed under the permissive [MIT License](LICENSE).
+Copyright &copy; 2026 Perseus Computing LLC. Released under the [MIT License](LICENSE).
