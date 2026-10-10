@@ -24,7 +24,7 @@ Argus records every event into an append-only sequence where each entry includes
 - **Continuous hash chaining:** Every event links cryptographically to the one before it, rooted at genesis.
 - **Fast tamper detection:** Scans 100,000 events in 46.00 &micro;s and fails closed the moment a single byte does not match.
 - **Low latency appends:** Appending an event takes 4.12 &micro;s, fast enough to log every action inline during agent execution.
-- **Self-contained:** Pure Rust that runs fully offline without external audit services or cloud dependencies.
+- **Self-contained:** Runs fully offline as an in-memory library without external audit services or cloud dependencies.
 
 ---
 
@@ -95,7 +95,7 @@ Measured on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fa
 | **Tamper Detection Latency** | **46.00 &micro;s** | Scan across 100k events |
 | **Verification Throughput** | **2,170,000 events/s** | Full chain validation traversal |
 | **Tamper Detection Rate** | **100.00%** | Single-bit byte flip sensitivity |
-| **External Dependencies** | **0** | Pure Rust offline primitives |
+| **External Dependencies** | **0** | Standalone offline primitives |
 
 Run benchmarks yourself:
 
