@@ -2,7 +2,7 @@
 
 from .models import AuditEvent, ChainVerificationReport, GENESIS_PREV_HASH
 from .canonical import canonical_json_bytes, canonical_json_dumps
-from .hasher import compute_event_hash, verify_event
+from .hasher import compute_event_hash, sign_event_hash, verify_event, verify_signature
 from .protocols import (
     AuditLedgerReader,
     AuditLedgerWriter,
@@ -22,6 +22,8 @@ __all__ = [
     "canonical_json_dumps",
     "compute_event_hash",
     "verify_event",
+    "sign_event_hash",
+    "verify_signature",
     "AuditLedgerReader",
     "AuditLedgerWriter",
     "AuditVerifier",
