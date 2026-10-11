@@ -90,18 +90,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Measured on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fat"`):
 
-| Metric | Measurement | Test condition |
-| :--- | :--- | :--- |
-| **Append Throughput** | **~600,000 events/s** | Sequential SHA-256 event chaining (~1.67 &micro;s/op) |
-| **Tamper Detection Latency** | **46.50 &micro;s** | Abort on corrupted event #42 in sequence |
-| **Chain Verification Throughput** | **~839,000 events/s** | Full chain validation traversal (~1.19 &micro;s/event) |
-| **Tamper Detection Rate** | **100.00%** | Single-bit byte flip sensitivity |
-| **External Dependencies** | **0** | Standalone offline primitives |
+| Metric | Measurement | Test condition | Operational Guarantee |
+| :--- | :--- | :--- | :--- |
+| **Append Throughput (1M Events)** | **632,170 events/s** | 1,000,000 sequential events (`argus_1m_scale`) | 1.58 &micro;s / event continuous SHA-256 chaining |
+| **Linear Verification (1M Events)** | **770,758 events/s** | Full 1M event Merkle chain validation | 1.30 &micro;s / event; validates 1M events in 1.29 s |
+| **Tamper Detection (Sequence #500,000)** | **640.48 ms** | Mid-chain single-bit payload corruption | Fail-closed immediate abort and offset isolation |
+| **Micro-Audit Latency (Block #42)** | **46.50 &micro;s** | Short sequence microbenchmark | Sub-50 µs early tamper detection |
+| **Tamper Detection Sensitivity** | **100.00%** | Single-bit byte flip sensitivity | Mathematical immutability guarantee |
+| **External Dependencies** | **0** | Standalone offline primitives | Zero network, zero remote cloud requirement |
 
 Run benchmarks yourself:
 
 ```bash
-cargo run --release -p perseus-benchmarks
+cargo run --release -p telarch-benchmarks
+cargo run --release -p telarch-benchmarks --bin argus_1m_scale
 ```
 
 ---

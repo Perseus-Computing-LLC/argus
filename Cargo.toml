@@ -7,7 +7,7 @@ description = "Tamper-evident append-only SHA-256 provenance and audit ledger fo
 license = "MIT"
 repository = "https://github.com/Perseus-Computing-LLC/argus"
 readme = "README.md"
-keywords = ["ai", "agents", "cognitive", "perseus"]
+keywords = ["ai", "agents", "cognitive", "telarch"]
 categories = ["development-tools"]
 
 [dependencies]
