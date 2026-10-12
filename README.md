@@ -86,6 +86,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
+## Python: keyed signing (optional)
+
+An unkeyed hash chain detects an edit to one record, but someone who can write the file can rewrite every later hash and still pass. Give the ledger a key and each event also carries an HMAC-SHA256 signature; the same rewrite then fails at the first forged event.
+
+```python
+from argus_ledger import AppendOnlyLedger
+
+key = AppendOnlyLedger.load_key("/secure/location/argus.key")   # refuses a key file others can read
+ledger = AppendOnlyLedger("audit.jsonl", signing_key=key, require_signature=True)
+ledger.append("tool_execution", "agent", {"tool": "terminal"})
+assert ledger.verify_chain().valid
+```
+
+The ledger file is created owner-only (0600). Keep the key somewhere an attacker with write access to the ledger cannot also reach. Ledgers written without a key still verify without one; with a key configured, unsigned events fail.
+
 ## Benchmark results
 
 Measured on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fat"`):

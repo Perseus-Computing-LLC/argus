@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 from typing import Any, Dict
 from .canonical import canonical_json_bytes
 from .models import AuditEvent
@@ -40,3 +41,15 @@ def verify_event(event: AuditEvent) -> bool:
         payload=event.payload,
     )
     return event.event_hash == expected_hash
+
+
+def sign_event_hash(event_hash: str, key: bytes) -> str:
+    """HMAC-SHA256 over an event hash. Without the key, a rewritten chain cannot be re-signed."""
+    return hmac.new(key, event_hash.encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def verify_signature(event: AuditEvent, key: bytes) -> bool:
+    """True when the event carries a signature that matches its hash under ``key``."""
+    if not event.signature:
+        return False
+    return hmac.compare_digest(event.signature, sign_event_hash(event.event_hash, key))

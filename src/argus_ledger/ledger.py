@@ -8,7 +8,7 @@ import json
 import os
 import uuid
 from typing import Any, Dict, Iterator, List, Optional
-from .hasher import compute_event_hash, verify_event
+from .hasher import compute_event_hash, sign_event_hash, verify_event, verify_signature
 from .models import AuditEvent, ChainVerificationReport, GENESIS_PREV_HASH
 from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier
 
@@ -16,12 +16,29 @@ from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier
 class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
     """Append-only audit ledger backed by a JSON-L file with POSIX file locking."""
 
-    def __init__(self, ledger_path: str) -> None:
+    def __init__(self, ledger_path: str, signing_key: Optional[bytes] = None, *, require_signature: bool = False) -> None:
+        """``signing_key``: when set, every event is signed with HMAC-SHA256, and verification fails for an
+        event whose signature is missing or wrong. Rewriting the whole chain then needs the key, not just the file.
+        ``require_signature=True`` refuses to open without a key. The ledger file is created owner-only (0600)."""
+        if require_signature and not signing_key:
+            raise ValueError("require_signature=True needs a signing_key")
+        if signing_key is not None and len(signing_key) < 16:
+            raise ValueError("signing_key must be at least 16 bytes")
+        self._key = signing_key
         self.ledger_path = os.path.abspath(ledger_path)
         os.makedirs(os.path.dirname(self.ledger_path), exist_ok=True)
         if not os.path.exists(self.ledger_path):
-            with open(self.ledger_path, "a", encoding="utf-8"):
-                pass
+            fd = os.open(self.ledger_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(fd)
+
+    @staticmethod
+    def load_key(path: str) -> bytes:
+        """Read a signing key from a file that only its owner can access."""
+        mode = os.stat(path).st_mode & 0o777
+        if mode & 0o077:
+            raise PermissionError(f"Key file {path} is readable by group or others (mode {mode:o}); chmod 600 it.")
+        with open(path, "rb") as fh:
+            return fh.read().strip()
 
     def append(
         self,
@@ -66,6 +83,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     payload=payload,
                     prev_hash=prev_hash,
                     event_hash=event_hash,
+                    signature=sign_event_hash(event_hash, self._key) if self._key else None,
                 )
 
                 f.seek(0, os.SEEK_END)
@@ -161,6 +179,17 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     head_hash=events[-1].event_hash,
                     first_broken_sequence=event.sequence,
                     error_detail=f"Tampered payload or signature at sequence {event.sequence}",
+                    checked_at=now_ts,
+                )
+
+            if self._key is not None and not verify_signature(event, self._key):
+                return ChainVerificationReport(
+                    valid=False,
+                    total_events=len(events),
+                    root_hash=events[0].event_hash,
+                    head_hash=events[-1].event_hash,
+                    first_broken_sequence=event.sequence,
+                    error_detail=f"Missing or invalid signature at sequence {event.sequence}",
                     checked_at=now_ts,
                 )
 
