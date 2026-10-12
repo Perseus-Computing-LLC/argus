@@ -377,6 +377,8 @@ impl AuditVerifier for InMemoryLedger {
             });
         }
 
+        let root_hash = store.first().map(|e| e.event_hash.clone()).unwrap_or_default();
+        let head_hash = store.last().map(|e| e.event_hash.clone()).unwrap_or_default();
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
         for (idx, event) in store.iter().enumerate() {
             let expected_seq = (idx as u64) + 1;
@@ -384,8 +386,8 @@ impl AuditVerifier for InMemoryLedger {
                 return Ok(ChainVerificationReport {
                     valid: false,
                     total_events: store.len(),
-                    root_hash: store[0].event_hash.clone(),
-                    head_hash: store.last().unwrap().event_hash.clone(),
+                    root_hash: root_hash.clone(),
+                    head_hash: head_hash.clone(),
                     first_broken_sequence: Some(event.sequence),
                     error_detail: Some(format!("Discontinuous sequence at index {}", idx)),
                     checked_at,
@@ -396,8 +398,8 @@ impl AuditVerifier for InMemoryLedger {
                 return Ok(ChainVerificationReport {
                     valid: false,
                     total_events: store.len(),
-                    root_hash: store[0].event_hash.clone(),
-                    head_hash: store.last().unwrap().event_hash.clone(),
+                    root_hash: root_hash.clone(),
+                    head_hash: head_hash.clone(),
                     first_broken_sequence: Some(event.sequence),
                     error_detail: Some(format!(
                         "Broken prev_hash chain at sequence {}",
@@ -421,8 +423,8 @@ impl AuditVerifier for InMemoryLedger {
                 return Ok(ChainVerificationReport {
                     valid: false,
                     total_events: store.len(),
-                    root_hash: store[0].event_hash.clone(),
-                    head_hash: store.last().unwrap().event_hash.clone(),
+                    root_hash: root_hash.clone(),
+                    head_hash: head_hash.clone(),
                     first_broken_sequence: Some(event.sequence),
                     error_detail: Some(format!(
                         "Tampered content hash at sequence {}",
@@ -438,8 +440,8 @@ impl AuditVerifier for InMemoryLedger {
         Ok(ChainVerificationReport {
             valid: true,
             total_events: store.len(),
-            root_hash: store[0].event_hash.clone(),
-            head_hash: store.last().unwrap().event_hash.clone(),
+            root_hash,
+            head_hash,
             first_broken_sequence: None,
             error_detail: None,
             checked_at,
@@ -457,6 +459,16 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn test_empty_ledger_verification() {
+        let ledger = InMemoryLedger::new();
+        let report = ledger.verify_chain().expect("Empty chain should verify without panicking");
+        assert!(report.valid);
+        assert_eq!(report.total_events, 0);
+        assert_eq!(report.root_hash, "");
+        assert_eq!(report.head_hash, "");
     }
 
     #[test]
