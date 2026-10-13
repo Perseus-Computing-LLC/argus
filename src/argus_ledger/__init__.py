@@ -12,7 +12,7 @@ from .protocols import (
 )
 from .ledger import AppendOnlyLedger
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 
 __all__ = [
     "AuditEvent",
