@@ -247,6 +247,49 @@ pub fn sha256_hex(input: &[u8]) -> String {
     result
 }
 
+/// Sign an event hash using Ed25519 asymmetric cryptography.
+pub fn sign_event_hash_ed25519(event_hash: &str, private_key_bytes: &[u8; 32]) -> String {
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing_key = SigningKey::from_bytes(private_key_bytes);
+    let signature = signing_key.sign(event_hash.as_bytes());
+    let sig_bytes = signature.to_bytes();
+    let mut hex = String::with_capacity(sig_bytes.len() * 2 + 8);
+    hex.push_str("ed25519:");
+    for b in sig_bytes {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
+}
+
+/// Verify an event hash using Ed25519 public key.
+pub fn verify_event_hash_ed25519(event_hash: &str, signature_hex: &str, public_key_bytes: &[u8; 32]) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let sig_str = match signature_hex.strip_prefix("ed25519:") {
+        Some(s) => s,
+        None => return false,
+    };
+    if sig_str.len() != 128 {
+        return false;
+    }
+    let mut sig_bytes = [0u8; 64];
+    for (i, chunk) in sig_str.as_bytes().chunks_exact(2).enumerate() {
+        let byte_str = match std::str::from_utf8(chunk) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        match u8::from_str_radix(byte_str, 16) {
+            Ok(b) => sig_bytes[i] = b,
+            Err(_) => return false,
+        }
+    }
+    let verifying_key = match VerifyingKey::from_bytes(public_key_bytes) {
+        Ok(vk) => vk,
+        Err(_) => return false,
+    };
+    let signature = Signature::from_bytes(&sig_bytes);
+    verifying_key.verify(event_hash.as_bytes(), &signature).is_ok()
+}
+
 /// Compute the canonical SHA-256 event hash across all event metadata and payload fields.
 pub fn compute_event_hash(
     sequence: u64,
@@ -490,5 +533,19 @@ mod tests {
         assert!(report.valid);
         assert_eq!(report.total_events, 2);
         assert_eq!(report.head_hash, ev2.event_hash);
+    }
+
+    #[test]
+    fn test_ed25519_signing_and_verification() {
+        let priv_bytes = [42u8; 32];
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&priv_bytes);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+
+        let event_hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let sig = sign_event_hash_ed25519(event_hash, &priv_bytes);
+        assert!(sig.starts_with("ed25519:"));
+
+        assert!(verify_event_hash_ed25519(event_hash, &sig, &pub_bytes));
+        assert!(!verify_event_hash_ed25519("tampered_hash", &sig, &pub_bytes));
     }
 }

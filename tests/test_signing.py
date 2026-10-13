@@ -90,6 +90,32 @@ class TestSigning(unittest.TestCase):
         os.chmod(kf, 0o600)
         self.assertEqual(AppendOnlyLedger.load_key(kf), KEY)
 
+    def test_ed25519_asymmetric_signatures_and_verification(self):
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+
+        priv = ed25519.Ed25519PrivateKey.generate()
+        priv_bytes = priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+        pub_bytes = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+        # Append using Ed25519 private key
+        ledger = AppendOnlyLedger(self.path, signing_key=priv_bytes, use_ed25519=True)
+        ev1 = ledger.append("task.start", "worker", {"task": "deploy"})
+        self.assertIsNotNone(ev1.signature)
+        self.assertTrue(ev1.signature and ev1.signature.startswith("ed25519:"))
+
+        # Verify with public key
+        reader_ledger = AppendOnlyLedger(self.path, signing_key=pub_bytes)
+        report = reader_ledger.verify_chain()
+        self.assertTrue(report.valid)
+        self.assertEqual(report.total_events, 1)
+
+        # Full chain rewrite without private key fails
+        _rewrite_chain_without_key(self.path, 1, {"task": "tampered"})
+        forged_report = reader_ledger.verify_chain()
+        self.assertFalse(forged_report.valid)
+        self.assertEqual(forged_report.first_broken_sequence, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,15 +16,27 @@ from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier
 class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
     """Append-only audit ledger backed by a JSON-L file with POSIX file locking."""
 
-    def __init__(self, ledger_path: str, signing_key: Optional[bytes] = None, *, require_signature: bool = False) -> None:
-        """``signing_key``: when set, every event is signed with HMAC-SHA256, and verification fails for an
-        event whose signature is missing or wrong. Rewriting the whole chain then needs the key, not just the file.
+    def __init__(
+        self,
+        ledger_path: str,
+        signing_key: Optional[bytes] = None,
+        *,
+        require_signature: bool = False,
+        use_ed25519: bool = False,
+    ) -> None:
+        """``signing_key``: when set, every event is signed with HMAC-SHA256 (or Ed25519 if use_ed25519=True),
+        and verification fails for an event whose signature is missing or wrong.
+        Rewriting the whole chain then needs the key, not just the file.
         ``require_signature=True`` refuses to open without a key. The ledger file is created owner-only (0600)."""
         if require_signature and not signing_key:
             raise ValueError("require_signature=True needs a signing_key")
         if signing_key is not None and len(signing_key) < 16:
             raise ValueError("signing_key must be at least 16 bytes")
+        if use_ed25519:
+            if signing_key is None or len(signing_key) != 32:
+                raise ValueError("use_ed25519=True requires a 32-byte Ed25519 seed/private key")
         self._key = signing_key
+        self._use_ed25519 = use_ed25519
         self.ledger_path = os.path.abspath(ledger_path)
         os.makedirs(os.path.dirname(self.ledger_path), exist_ok=True)
         if not os.path.exists(self.ledger_path):
@@ -74,6 +86,15 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     payload=payload,
                 )
 
+                if self._key:
+                    if self._use_ed25519:
+                        from .hasher import sign_event_hash_ed25519
+                        sig = sign_event_hash_ed25519(event_hash, self._key)
+                    else:
+                        sig = sign_event_hash(event_hash, self._key)
+                else:
+                    sig = None
+
                 event = AuditEvent(
                     sequence=sequence,
                     event_id=eid,
@@ -83,7 +104,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     payload=payload,
                     prev_hash=prev_hash,
                     event_hash=event_hash,
-                    signature=sign_event_hash(event_hash, self._key) if self._key else None,
+                    signature=sig,
                 )
 
                 f.seek(0, os.SEEK_END)

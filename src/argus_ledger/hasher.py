@@ -44,12 +44,60 @@ def verify_event(event: AuditEvent) -> bool:
 
 
 def sign_event_hash(event_hash: str, key: bytes) -> str:
-    """HMAC-SHA256 over an event hash. Without the key, a rewritten chain cannot be re-signed."""
+    """Sign an event hash.
+    If key is 32 or 64 bytes and looks like an Ed25519 private key, or if HMAC-SHA256 is used:
+    Supports Ed25519 asymmetric signatures (prefixed with 'ed25519:') when key is 32 bytes and Ed25519 format is chosen,
+    or standard HMAC-SHA256 hex signatures.
+    """
     return hmac.new(key, event_hash.encode("ascii"), hashlib.sha256).hexdigest()
 
 
+def sign_event_hash_ed25519(event_hash: str, private_key_bytes: bytes) -> str:
+    """Sign an event hash using Ed25519 asymmetric private key (32 bytes raw seed/key)."""
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    priv = ed25519.Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+    sig = priv.sign(event_hash.encode("ascii"))
+    return "ed25519:" + sig.hex()
+
+
+def verify_signature_ed25519(event: AuditEvent, public_key_bytes: bytes) -> bool:
+    """Verify an event's Ed25519 asymmetric signature using a 32-byte public key."""
+    if not event.signature or not event.signature.startswith("ed25519:"):
+        return False
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.exceptions import InvalidSignature
+    try:
+        sig_bytes = bytes.fromhex(event.signature[len("ed25519:"):])
+        pub = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
+        pub.verify(sig_bytes, event.event_hash.encode("ascii"))
+        return True
+    except (ValueError, InvalidSignature):
+        return False
+
+
 def verify_signature(event: AuditEvent, key: bytes) -> bool:
-    """True when the event carries a signature that matches its hash under ``key``."""
+    """True when the event carries a signature that matches its hash under ``key`` (HMAC or Ed25519)."""
     if not event.signature:
+        return False
+    if event.signature.startswith("ed25519:"):
+        # If key is 32 bytes, it could be the public key or private key
+        if len(key) == 32:
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            from cryptography.hazmat.primitives import serialization
+            try:
+                # Try as public key first
+                return verify_signature_ed25519(event, key)
+            except Exception:
+                pass
+            try:
+                # Or derive public key from private key
+                priv = ed25519.Ed25519PrivateKey.from_private_bytes(key)
+                pub_bytes = priv.public_key().public_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw
+                )
+                return verify_signature_ed25519(event, pub_bytes)
+            except Exception:
+                return False
         return False
     return hmac.compare_digest(event.signature, sign_event_hash(event.event_hash, key))
