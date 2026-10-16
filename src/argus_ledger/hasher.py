@@ -86,7 +86,8 @@ def verify_signature(event: AuditEvent, key: bytes) -> bool:
             from cryptography.hazmat.primitives import serialization
             try:
                 # Try as public key first
-                return verify_signature_ed25519(event, key)
+                if verify_signature_ed25519(event, key):
+                    return True
             except Exception:
                 pass
             try:

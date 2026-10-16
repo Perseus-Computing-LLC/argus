@@ -10,7 +10,7 @@ import uuid
 from typing import Any, Dict, Iterator, List, Optional
 from .hasher import compute_event_hash, sign_event_hash, verify_event, verify_signature
 from .models import AuditEvent, ChainVerificationReport, GENESIS_PREV_HASH
-from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier
+from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier, LedgerCorruptionError
 
 
 class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
@@ -72,9 +72,14 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     sequence = 1
                     prev_hash = GENESIS_PREV_HASH
                 else:
-                    last_obj = json.loads(lines[-1])
-                    sequence = last_obj["sequence"] + 1
-                    prev_hash = last_obj["event_hash"]
+                    try:
+                        last_obj = json.loads(lines[-1])
+                        sequence = int(last_obj["sequence"]) + 1
+                        prev_hash = str(last_obj["event_hash"])
+                    except (ValueError, KeyError, TypeError) as exc:
+                        raise LedgerCorruptionError(
+                            f"Cannot append to ledger with corrupted tail record at line {len(lines)}: {exc}"
+                        ) from exc
 
                 event_hash = compute_event_hash(
                     sequence=sequence,
@@ -125,7 +130,12 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                 lines = [line.strip() for line in f if line.strip()]
                 if not lines:
                     return None
-                return AuditEvent.model_validate_json(lines[-1])
+                try:
+                    return AuditEvent.model_validate_json(lines[-1])
+                except Exception as exc:
+                    raise LedgerCorruptionError(
+                        f"Malformed tail event record at line {len(lines)}: {exc}"
+                    ) from exc
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
@@ -142,11 +152,16 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         with open(self.ledger_path, "r", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             try:
-                for line in f:
+                for line_no, line in enumerate(f, start=1):
                     line = line.strip()
                     if not line:
                         continue
-                    event = AuditEvent.model_validate_json(line)
+                    try:
+                        event = AuditEvent.model_validate_json(line)
+                    except Exception as exc:
+                        raise LedgerCorruptionError(
+                            f"Malformed event record at line {line_no}: {exc}"
+                        ) from exc
                     if event.sequence < start:
                         continue
                     if end is not None and event.sequence > end:
@@ -158,8 +173,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
     def verify_chain(self) -> ChainVerificationReport:
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        events: List[AuditEvent] = list(self.iter_events())
-        if not events:
+        if not os.path.exists(self.ledger_path):
             return ChainVerificationReport(
                 valid=True,
                 total_events=0,
@@ -167,6 +181,39 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                 head_hash="",
                 checked_at=now_ts,
             )
+
+        events: List[AuditEvent] = []
+        with open(self.ledger_path, "r", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                raw_lines = [line.strip() for line in f if line.strip()]
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        if not raw_lines:
+            return ChainVerificationReport(
+                valid=True,
+                total_events=0,
+                root_hash="",
+                head_hash="",
+                checked_at=now_ts,
+            )
+
+        for idx, line in enumerate(raw_lines, start=1):
+            try:
+                events.append(AuditEvent.model_validate_json(line))
+            except Exception as exc:
+                root_hash = events[0].event_hash if events else ""
+                head_hash = events[-1].event_hash if events else ""
+                return ChainVerificationReport(
+                    valid=False,
+                    total_events=len(raw_lines),
+                    root_hash=root_hash,
+                    head_hash=head_hash,
+                    first_broken_sequence=idx,
+                    error_detail=f"Malformed or partial event record at sequence {idx}: {exc}",
+                    checked_at=now_ts,
+                )
 
         expected_prev = GENESIS_PREV_HASH
         for idx, event in enumerate(events, start=1):

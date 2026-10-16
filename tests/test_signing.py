@@ -104,6 +104,11 @@ class TestSigning(unittest.TestCase):
         self.assertIsNotNone(ev1.signature)
         self.assertTrue(ev1.signature and ev1.signature.startswith("ed25519:"))
 
+        # Verify directly on the private-key writer ledger (derives public key from seed)
+        writer_report = ledger.verify_chain()
+        self.assertTrue(writer_report.valid)
+        self.assertEqual(writer_report.total_events, 1)
+
         # Verify with public key
         reader_ledger = AppendOnlyLedger(self.path, signing_key=pub_bytes)
         report = reader_ledger.verify_chain()

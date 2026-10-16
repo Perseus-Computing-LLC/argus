@@ -9,6 +9,7 @@ from argus_ledger import (
     AuditEvent,
     ChainVerificationReport,
     GENESIS_PREV_HASH,
+    LedgerCorruptionError,
     canonical_json_dumps,
     compute_event_hash,
 )
@@ -85,6 +86,24 @@ class TestArgusContracts(unittest.TestCase):
         report_tampered = self.ledger.verify_chain()
         self.assertFalse(report_tampered.valid)
         self.assertEqual(report_tampered.first_broken_sequence, 2)
+
+    def test_partial_write_and_malformed_record_fail_closed(self):
+        self.ledger.append("event.1", "actor", {"val": 1})
+        self.ledger.append("event.2", "actor", {"val": 2})
+
+        # Simulate a truncated partial write at sequence 3
+        with open(self.ledger_file, "a", encoding="utf-8") as f:
+            f.write('{"sequence": 3, "event_id": "partial-crash\n')
+
+        report = self.ledger.verify_chain()
+        self.assertFalse(report.valid)
+        self.assertEqual(report.first_broken_sequence, 3)
+        self.assertIn("Malformed or partial event record", report.error_detail or "")
+
+        with self.assertRaises(LedgerCorruptionError):
+            self.ledger.head()
+        with self.assertRaises(LedgerCorruptionError):
+            self.ledger.append("event.4", "actor", {"val": 4})
 
 
 if __name__ == "__main__":

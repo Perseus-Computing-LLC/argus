@@ -16,6 +16,11 @@ class TamperDetectedError(LedgerError):
     pass
 
 
+class LedgerCorruptionError(LedgerError):
+    """Raised when the ledger file contains malformed JSON or partial-write corruption."""
+    pass
+
+
 @runtime_checkable
 class AuditLedgerWriter(Protocol):
     """Writer interface for appending audit events."""

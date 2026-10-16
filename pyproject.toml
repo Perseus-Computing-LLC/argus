@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "argus-ledger"
-version = "0.1.0a2"
+version = "0.1.0a3"
 description = "Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents."
 readme = "README.md"
 authors = [
@@ -27,3 +27,9 @@ dependencies = ["pydantic>=2"]
 [project.urls]
 Homepage = "https://github.com/Perseus-Computing-LLC/argus"
 Repository = "https://github.com/Perseus-Computing-LLC/argus"
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
