@@ -51,6 +51,7 @@
 //! assert_eq!(report.head_hash, ev2.event_hash);
 //! ```
 
+use std::borrow::Borrow;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -401,7 +402,22 @@ pub fn compute_event_hash(
     payload: &str,
 ) -> String {
     let digest = compute_payload_digest(payload);
-    let fields: [&str; 6] = [event_id, timestamp, event_type, actor, prev_hash, &digest];
+    compute_event_hash_from_digest(
+        sequence, event_id, timestamp, event_type, actor, prev_hash, &digest,
+    )
+}
+
+/// [`compute_event_hash`] for a precomputed [`compute_payload_digest`]: O(header) work.
+pub fn compute_event_hash_from_digest(
+    sequence: u64,
+    event_id: &str,
+    timestamp: &str,
+    event_type: &str,
+    actor: &str,
+    prev_hash: &str,
+    digest: &str,
+) -> String {
+    let fields = [event_id, timestamp, event_type, actor, prev_hash, digest];
     let mut preimage = EVENT_HASH_DOMAIN.to_vec();
     preimage.extend_from_slice(&sequence.to_be_bytes());
     for field in fields {
@@ -480,7 +496,7 @@ fn parse_canonical_u64(s: &str) -> Option<u64> {
 /// Thread-safe in-memory reference implementation of an append-only audit ledger.
 #[derive(Clone)]
 pub struct InMemoryLedger {
-    events: Arc<Mutex<Vec<AuditEvent>>>,
+    events: Arc<Mutex<Vec<Arc<AuditEvent>>>>,
     signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     /// Random per-instance identity bound into every `event_id`, so two ledgers (or one ledger
     /// across a restart) never produce interchangeable events.
@@ -513,6 +529,15 @@ impl InMemoryLedger {
             ..Self::default()
         }
     }
+
+    /// O(n) pointer copy under the lock; all O(bytes) work happens after it is released.
+    fn snapshot(&self) -> Result<Vec<Arc<AuditEvent>>, LedgerError> {
+        let store = self
+            .events
+            .lock()
+            .map_err(|e| LedgerError::LockError(e.to_string()))?;
+        Ok(store.clone())
+    }
 }
 
 impl AuditLedgerWriter for InMemoryLedger {
@@ -533,6 +558,9 @@ impl AuditLedgerWriter for InMemoryLedger {
             .ok()
             .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
             .ok_or_else(|| LedgerError::InvalidTimestamp("clock outside 1970-2554".into()))?;
+        // All O(payload) work (hashing, copying) happens before the lock is taken.
+        let digest = compute_payload_digest(payload);
+        let payload = payload.to_owned();
         let mut store = self
             .events
             .lock()
@@ -552,28 +580,28 @@ impl AuditLedgerWriter for InMemoryLedger {
             .to_string();
         let event_id = format!("ev_{}_{}", self.ledger_id, sequence);
 
-        let event_hash = compute_event_hash(
-            sequence, &event_id, &timestamp, event_type, actor, &prev_hash, payload,
+        let event_hash = compute_event_hash_from_digest(
+            sequence, &event_id, &timestamp, event_type, actor, &prev_hash, &digest,
         );
         let signature = self
             .signing_key
             .as_deref()
             .map(|key| sign_event_hash(key, &event_hash));
 
-        let event = AuditEvent {
+        let event = Arc::new(AuditEvent {
             sequence,
             event_id,
             timestamp,
             event_type: event_type.to_string(),
             actor: actor.to_string(),
-            payload: payload.to_string(),
+            payload,
             prev_hash,
             event_hash,
             signature,
-        };
-
-        store.push(event.clone());
-        Ok(event)
+        });
+        store.push(Arc::clone(&event));
+        drop(store); // the caller's copy is made outside the critical section
+        Ok(Arc::unwrap_or_clone(event))
     }
 }
 
@@ -583,11 +611,13 @@ impl AuditLedgerReader for InMemoryLedger {
             .events
             .lock()
             .map_err(|e| LedgerError::LockError(e.to_string()))?;
-        if sequence == 0 || sequence > (store.len() as u64) {
-            Ok(None)
+        let event = if sequence == 0 || sequence > (store.len() as u64) {
+            None
         } else {
-            Ok(Some(store[(sequence - 1) as usize].clone()))
-        }
+            Some(Arc::clone(&store[(sequence - 1) as usize]))
+        };
+        drop(store);
+        Ok(event.map(Arc::unwrap_or_clone))
     }
 
     fn head(&self) -> Result<Option<AuditEvent>, LedgerError> {
@@ -595,15 +625,14 @@ impl AuditLedgerReader for InMemoryLedger {
             .events
             .lock()
             .map_err(|e| LedgerError::LockError(e.to_string()))?;
-        Ok(store.last().cloned())
+        let head = store.last().cloned();
+        drop(store);
+        Ok(head.map(Arc::unwrap_or_clone))
     }
 
     fn all_events(&self) -> Result<Vec<AuditEvent>, LedgerError> {
-        let store = self
-            .events
-            .lock()
-            .map_err(|e| LedgerError::LockError(e.to_string()))?;
-        Ok(store.clone())
+        let snapshot = self.snapshot()?;
+        Ok(snapshot.into_iter().map(Arc::unwrap_or_clone).collect())
     }
 }
 
@@ -612,18 +641,18 @@ impl AuditVerifier for InMemoryLedger {
         &self,
         policy: &VerificationPolicy,
     ) -> Result<ChainVerificationReport, LedgerError> {
-        let store = self
-            .events
-            .lock()
-            .map_err(|e| LedgerError::LockError(e.to_string()))?;
-        policy.verify(&store)
+        policy.verify(&self.snapshot()?)
     }
 }
 
 impl VerificationPolicy {
     /// Verify an exported or persisted event sequence, such as the output of `all_events()`.
     /// Without `self.anchor` this proves internal consistency only.
-    pub fn verify(&self, events: &[AuditEvent]) -> Result<ChainVerificationReport, LedgerError> {
+    pub fn verify<E: Borrow<AuditEvent>>(
+        &self,
+        events: &[E],
+    ) -> Result<ChainVerificationReport, LedgerError> {
+        let events: Vec<&AuditEvent> = events.iter().map(Borrow::<AuditEvent>::borrow).collect();
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

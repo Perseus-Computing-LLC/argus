@@ -318,3 +318,31 @@ fn f8_identifiers_and_payload_size_are_validated_before_recording() {
         .append("tool.exec", "arn:aws:iam::123456789012:user/alice", "{}")
         .unwrap();
 }
+
+#[test]
+fn f9_appends_proceed_while_a_large_chain_is_verified() {
+    let mut ledger = InMemoryLedger::new();
+    let blob = format!("{{\"blob\":\"{}\"}}", "a".repeat(MAX_PAYLOAD_BYTES - 16));
+    for _ in 0..32 {
+        ledger.append("bulk.ingest", "worker_1", &blob).unwrap();
+    }
+    let reader = ledger.clone();
+    let verifier = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        assert!(reader.verify_chain().unwrap().valid);
+        started.elapsed()
+    });
+    let (mut worst, mut appends) = (std::time::Duration::ZERO, 0u32);
+    while !verifier.is_finished() {
+        let started = std::time::Instant::now();
+        ledger.append("tool.exec", "worker_1", "{}").unwrap();
+        worst = worst.max(started.elapsed());
+        appends += 1;
+    }
+    let verify_time = verifier.join().unwrap();
+    assert!(appends > 0);
+    assert!(
+        worst * 4 < verify_time,
+        "append waited {worst:?} during a {verify_time:?} verify"
+    );
+}
