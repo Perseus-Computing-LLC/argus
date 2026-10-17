@@ -290,3 +290,31 @@ fn f7_ledger_identity_resolution_and_monotonic_time() {
         Some(LedgerError::InvalidTimestamp(_))
     ));
 }
+
+#[test]
+fn f8_identifiers_and_payload_size_are_validated_before_recording() {
+    let mut ledger = InMemoryLedger::new();
+    for (event_type, actor) in [
+        ("", "worker_1"),
+        ("tool.exec", ""),
+        ("tool.exec\n2026-10-17 INFO approved by", "worker_1"),
+        ("Tool.Exec", "worker_1"),
+        ("tool..exec", "worker_1"),
+        ("tool.exec", "\u{430}dmin"),
+        ("tool.exec", "worker\u{0}1"),
+        ("tool.exec", "worker 1"),
+    ] {
+        let result = ledger.append(event_type, actor, "{}");
+        assert!(
+            matches!(result, Err(LedgerError::InvalidInput(_))),
+            "{event_type:?} {actor:?}"
+        );
+    }
+    let oversized = format!("{{\"x\":\"{}\"}}", "A".repeat(MAX_PAYLOAD_BYTES));
+    let result = ledger.append("bulk.ingest", "worker_1", &oversized);
+    assert!(matches!(result, Err(LedgerError::InvalidInput(_))));
+    assert!(ledger.all_events().unwrap().is_empty());
+    ledger
+        .append("tool.exec", "arn:aws:iam::123456789012:user/alice", "{}")
+        .unwrap();
+}

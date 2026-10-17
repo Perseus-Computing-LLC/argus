@@ -411,6 +411,30 @@ pub fn compute_event_hash(
     sha256_hex(&preimage)
 }
 
+/// Largest `payload` accepted by `append`, bounding per-event memory and hashing work.
+pub const MAX_PAYLOAD_BYTES: usize = 1 << 20;
+/// Largest `event_type` or `actor` accepted by `append`.
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
+
+/// `event_type`: dot-separated `[a-z0-9_-]+` segments. `actor`: printable ASCII without
+/// whitespace, which rules out control characters, log-line injection, and Unicode homoglyphs.
+fn validate_identifiers(event_type: &str, actor: &str) -> Result<(), LedgerError> {
+    let type_byte = |b: u8| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
+    let segment = |s: &str| !s.is_empty() && s.bytes().all(type_byte);
+    if event_type.len() > MAX_IDENTIFIER_BYTES || !event_type.split('.').all(segment) {
+        let detail = "event_type must be dot-separated [a-z0-9_-]+ segments";
+        return Err(LedgerError::InvalidInput(detail.into()));
+    }
+    if actor.is_empty()
+        || actor.len() > MAX_IDENTIFIER_BYTES
+        || !actor.bytes().all(|b| b.is_ascii_graphic())
+    {
+        let detail = "actor must be printable ASCII without whitespace";
+        return Err(LedgerError::InvalidInput(detail.into()));
+    }
+    Ok(())
+}
+
 /// Largest integer magnitude exactly representable as an IEEE-754 double (RFC 7493 I-JSON).
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
@@ -498,6 +522,11 @@ impl AuditLedgerWriter for InMemoryLedger {
         actor: &str,
         payload: &str,
     ) -> Result<AuditEvent, LedgerError> {
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            let detail = format!("payload exceeds {MAX_PAYLOAD_BYTES} bytes");
+            return Err(LedgerError::InvalidInput(detail));
+        }
+        validate_identifiers(event_type, actor)?;
         validate_canonical_payload(payload)?;
         let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
