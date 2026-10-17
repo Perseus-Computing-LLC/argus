@@ -119,6 +119,9 @@ pub struct VerificationPolicy {
     /// If set, the chain must contain this event unchanged. Detects rollback, truncation below
     /// the anchor, and recomputed history; events appended after it remain unwitnessed.
     pub anchor: Option<ChainAnchor>,
+    /// If set, every event must carry a valid signature by this key; missing, stripped, or
+    /// foreign signatures fail verification.
+    pub verifying_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
 impl AuditEvent {
@@ -288,8 +291,13 @@ pub fn sha256_hex(input: &[u8]) -> String {
 
 /// Sign an event hash using Ed25519 asymmetric cryptography.
 pub fn sign_event_hash_ed25519(event_hash: &str, private_key_bytes: &[u8; 32]) -> String {
-    use ed25519_dalek::{Signer, SigningKey};
-    let signing_key = SigningKey::from_bytes(private_key_bytes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(private_key_bytes);
+    sign_event_hash(&signing_key, event_hash)
+}
+
+/// Sign an event hash with an existing Ed25519 signing key.
+pub fn sign_event_hash(signing_key: &ed25519_dalek::SigningKey, event_hash: &str) -> String {
+    use ed25519_dalek::Signer;
     let signature = signing_key.sign(event_hash.as_bytes());
     let sig_bytes = signature.to_bytes();
     let mut hex = String::with_capacity(sig_bytes.len() * 2 + 8);
@@ -366,12 +374,21 @@ pub fn compute_event_hash(
 #[derive(Default, Clone)]
 pub struct InMemoryLedger {
     events: Arc<Mutex<Vec<AuditEvent>>>,
+    signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
 }
 
 impl InMemoryLedger {
     /// Construct a new empty in-memory audit ledger.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a ledger that signs the hash of every event it appends.
+    pub fn with_signing_key(signing_key: ed25519_dalek::SigningKey) -> Self {
+        Self {
+            signing_key: Some(Arc::new(signing_key)),
+            ..Self::default()
+        }
     }
 }
 
@@ -403,6 +420,10 @@ impl AuditLedgerWriter for InMemoryLedger {
         let event_hash = compute_event_hash(
             sequence, &event_id, &timestamp, event_type, actor, &prev_hash, payload,
         );
+        let signature = self
+            .signing_key
+            .as_deref()
+            .map(|key| sign_event_hash(key, &event_hash));
 
         let event = AuditEvent {
             sequence,
@@ -413,7 +434,7 @@ impl AuditLedgerWriter for InMemoryLedger {
             payload: payload.to_string(),
             prev_hash,
             event_hash,
-            signature: None,
+            signature,
         };
 
         store.push(event.clone());
@@ -547,6 +568,26 @@ impl VerificationPolicy {
                     )),
                     checked_at,
                 });
+            }
+
+            if let Some(key) = &self.verifying_key {
+                let signed = event.signature.as_deref().is_some_and(|signature| {
+                    verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
+                });
+                if !signed {
+                    return Ok(ChainVerificationReport {
+                        valid: false,
+                        total_events: events.len(),
+                        root_hash: root_hash.clone(),
+                        head_hash: head_hash.clone(),
+                        first_broken_sequence: Some(event.sequence),
+                        error_detail: Some(format!(
+                            "Missing or invalid signature at sequence {}",
+                            event.sequence
+                        )),
+                        checked_at,
+                    });
+                }
             }
 
             expected_prev = event.event_hash.clone();

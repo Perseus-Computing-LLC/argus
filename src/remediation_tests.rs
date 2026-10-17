@@ -137,3 +137,30 @@ fn f2_v2_golden_vectors_match_an_independent_python_implementation() {
         "27d2430b331e10c1899d323d86bf12ccadc7e8b07772d3941707717cc8a05273"
     );
 }
+
+#[test]
+fn f3_signed_ledger_rejects_stripped_forged_and_foreign_signatures() {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let mut ledger = InMemoryLedger::with_signing_key(key.clone());
+    let ev = ledger.append("tool.exec", "worker_1", "{}").unwrap();
+    assert!(ev.signature.is_some(), "append signs");
+    let policy = VerificationPolicy {
+        verifying_key: Some(key.verifying_key()),
+        ..Default::default()
+    };
+    assert!(ledger.verify_chain_with(&policy).unwrap().valid);
+    let honest = ledger.all_events().unwrap();
+    let foreign = sign_event_hash_ed25519(&ev.event_hash, &[9u8; 32]);
+    for tampered in [None, Some("ed25519:forged".to_string()), Some(foreign)] {
+        let mut events = honest.clone();
+        events[0].signature = tampered;
+        assert!(!policy.verify(&events).unwrap().valid);
+    }
+    let mut events = honest.clone();
+    events[0].payload = "{\"forged\":true}".into();
+    relink(&mut events);
+    assert!(
+        !policy.verify(&events).unwrap().valid,
+        "rewrite needs the private key"
+    );
+}
