@@ -289,6 +289,10 @@ pub fn sha256_hex(input: &[u8]) -> String {
     result
 }
 
+/// Domain tag prepended to the event hash before signing, so an Argus signature can neither be
+/// replayed into nor produced by another protocol that uses the same key.
+const SIGNATURE_DOMAIN: &[u8] = b"argus.event.sig.v1\0";
+
 /// Sign an event hash using Ed25519 asymmetric cryptography.
 pub fn sign_event_hash_ed25519(event_hash: &str, private_key_bytes: &[u8; 32]) -> String {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(private_key_bytes);
@@ -298,7 +302,7 @@ pub fn sign_event_hash_ed25519(event_hash: &str, private_key_bytes: &[u8; 32]) -
 /// Sign an event hash with an existing Ed25519 signing key.
 pub fn sign_event_hash(signing_key: &ed25519_dalek::SigningKey, event_hash: &str) -> String {
     use ed25519_dalek::Signer;
-    let signature = signing_key.sign(event_hash.as_bytes());
+    let signature = signing_key.sign(&[SIGNATURE_DOMAIN, event_hash.as_bytes()].concat());
     let sig_bytes = signature.to_bytes();
     let mut hex = String::with_capacity(sig_bytes.len() * 2 + 8);
     hex.push_str("ed25519:");
@@ -308,33 +312,46 @@ pub fn sign_event_hash(signing_key: &ed25519_dalek::SigningKey, event_hash: &str
     hex
 }
 
-/// Verify an event hash using Ed25519 public key.
-pub fn verify_event_hash_ed25519(event_hash: &str, signature_hex: &str, public_key_bytes: &[u8; 32]) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let sig_str = match signature_hex.strip_prefix("ed25519:") {
-        Some(s) => s,
-        None => return false,
-    };
-    if sig_str.len() != 128 {
+/// Verify an event-hash signature. Only the lowercase-hex `ed25519:` encoding is accepted, and
+/// verification is strict (`verify_strict` rejects small-order public keys and `R` points).
+pub fn verify_event_hash_ed25519(
+    event_hash: &str,
+    signature_hex: &str,
+    public_key_bytes: &[u8; 32],
+) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let Some(sig_bytes) = signature_hex
+        .strip_prefix("ed25519:")
+        .and_then(decode_lower_hex::<64>)
+    else {
         return false;
-    }
-    let mut sig_bytes = [0u8; 64];
-    for (i, chunk) in sig_str.as_bytes().chunks_exact(2).enumerate() {
-        let byte_str = match std::str::from_utf8(chunk) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        match u8::from_str_radix(byte_str, 16) {
-            Ok(b) => sig_bytes[i] = b,
-            Err(_) => return false,
-        }
-    }
-    let verifying_key = match VerifyingKey::from_bytes(public_key_bytes) {
-        Ok(vk) => vk,
-        Err(_) => return false,
     };
-    let signature = Signature::from_bytes(&sig_bytes);
-    verifying_key.verify(event_hash.as_bytes(), &signature).is_ok()
+    let Ok(verifying_key) = VerifyingKey::from_bytes(public_key_bytes) else {
+        return false;
+    };
+    let message = [SIGNATURE_DOMAIN, event_hash.as_bytes()].concat();
+    verifying_key
+        .verify_strict(&message, &Signature::from_bytes(&sig_bytes))
+        .is_ok()
+}
+
+/// Decode exactly `N` bytes of lowercase hex. Uppercase digits, signs, and every other byte are
+/// rejected, so each signature has exactly one accepted string form.
+fn decode_lower_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let bytes = hex.as_bytes();
+    if bytes.len() != 2 * N {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (byte, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(out)
 }
 
 /// Domain tag for event-hash preimages (hash format v2).

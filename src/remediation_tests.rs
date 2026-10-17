@@ -164,3 +164,38 @@ fn f3_signed_ledger_rejects_stripped_forged_and_foreign_signatures() {
         "rewrite needs the private key"
     );
 }
+
+#[test]
+fn f4_weak_keys_noncanonical_hex_and_untagged_signatures_are_rejected() {
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let universal = format!("ed25519:01{}{}", "00".repeat(31), "00".repeat(32));
+    assert!(!verify_event_hash_ed25519(
+        GENESIS_PREV_HASH,
+        &universal,
+        &identity
+    ));
+
+    let key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let pk = key.verifying_key().to_bytes();
+    let h = sha256_hex(b"event");
+    let sig = sign_event_hash(&key, &h);
+    assert!(verify_event_hash_ed25519(&h, &sig, &pk));
+    let upper = sig.to_uppercase().replacen("ED25519", "ed25519", 1);
+    assert!(!verify_event_hash_ed25519(&h, &upper, &pk));
+    assert_eq!(decode_lower_hex::<1>("0a"), Some([10]));
+    assert_eq!(decode_lower_hex::<1>("+a"), None);
+    assert_eq!(decode_lower_hex::<1>("0A"), None);
+
+    use ed25519_dalek::Signer;
+    let bare: String = key
+        .sign(h.as_bytes())
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(
+        !verify_event_hash_ed25519(&h, &format!("ed25519:{bare}"), &pk),
+        "no domain tag"
+    );
+}
