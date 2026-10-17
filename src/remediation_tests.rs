@@ -362,3 +362,59 @@ fn f10_poisoned_lock_is_recovered_without_data_loss() {
     assert_eq!(ledger.all_events().unwrap().len(), 2);
     assert!(ledger.verify_chain().unwrap().valid);
 }
+
+mod probe {
+    //! Per-thread live-heap counter (realloc = alloc + copy + free, an upper bound).
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    struct Probe;
+
+    unsafe impl GlobalAlloc for Probe {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                track(layout.size() as isize);
+            }
+            ptr
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) };
+            track(-(layout.size() as isize));
+        }
+    }
+
+    fn track(delta: isize) {
+        let _ = LIVE.try_with(|live| {
+            let now = live.get() + delta;
+            live.set(now);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+        });
+    }
+
+    #[global_allocator]
+    static GLOBAL: Probe = Probe;
+
+    pub fn peak_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+        let base = LIVE.with(Cell::get);
+        PEAK.with(|p| p.set(base));
+        let out = f();
+        (out, (PEAK.with(Cell::get) - base).max(0) as usize)
+    }
+}
+
+#[test]
+fn f11_hashing_streams_without_copying_the_input() {
+    let input = vec![b'a'; 1 << 20];
+    let (digest, peak) = probe::peak_during(|| sha256_hex(&input));
+    assert_eq!(digest.len(), 64);
+    assert!(peak <= 128, "sha256_hex(1 MiB) peak {peak} B");
+    let payload = format!("{{\"blob\":\"{}\"}}", "a".repeat(1 << 20));
+    let (_, peak) = probe::peak_during(|| compute_payload_digest(&payload));
+    assert!(peak <= 128, "compute_payload_digest(1 MiB) peak {peak} B");
+}

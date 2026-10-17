@@ -9,6 +9,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
