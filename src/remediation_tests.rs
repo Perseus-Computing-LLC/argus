@@ -486,3 +486,62 @@ fn measure_fixed_lock_hold() {
     let verify_time = verifier.join().unwrap();
     println!("[measure-fixed] verify_chain(96 x 1 MiB) {verify_time:?}; worst 2-byte append meanwhile {worst_append:?}");
 }
+
+#[test]
+fn opt_table_hex_matches_formatted_hex() {
+    for b in 0..=u8::MAX {
+        assert_eq!(hex_lower(&[b]), format!("{b:02x}"));
+    }
+    let digest: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(37) ^ 0xa5);
+    let formatted: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex_string(digest_hex(&digest)), formatted);
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
+fn opt_canonical_u64_parse_matches_the_allocating_reference() {
+    let reference = |s: &str| s.parse().ok().filter(|v: &u64| v.to_string() == s);
+    for s in [
+        "",
+        "0",
+        "00",
+        "01",
+        "1",
+        "+1",
+        "-1",
+        " 1",
+        "1 ",
+        "1_000",
+        "\u{0661}",
+        "18446744073709551615",
+        "18446744073709551616",
+        "018446744073709551615",
+        "1783000000000000000",
+    ] {
+        assert_eq!(parse_canonical_u64(s), reference(s), "input {s:?}");
+    }
+}
+
+#[test]
+fn opt_streaming_canonical_check_matches_reserialization() {
+    for (payload, canonical) in [
+        ("{\"a\":1}", true),
+        ("{\"a\":1} ", false),
+        (" {\"a\":1}", false),
+        ("{\"a\":1}{", false),
+        ("{\"a\": 1}", false),
+        ("{\"a\":\"\\u0041\"}", false),
+        ("{\"a\":\"\\n\"}", true),
+        ("{\"a\":[1,{\"b\":null,\"c\":true}],\"d\":\"\u{e9}\"}", true),
+        ("{}", true),
+    ] {
+        assert_eq!(
+            validate_canonical_payload(payload).is_ok(),
+            canonical,
+            "payload {payload:?}"
+        );
+    }
+}

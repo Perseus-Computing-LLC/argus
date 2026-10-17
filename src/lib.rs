@@ -224,16 +224,32 @@ pub trait AuditVerifier: Send + Sync {
 /// SHA-256 (FIPS 180-4) as lowercase hex, via RustCrypto `sha2`, which `ed25519-dalek` already
 /// links: streaming, no copy of the input, SHA-NI/ARMv8 accelerated where available.
 pub fn sha256_hex(input: &[u8]) -> String {
-    hex_lower(&Sha256::digest(input))
+    hex_string(digest_hex(&Sha256::digest(input).into()))
 }
 
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
 fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write;
     let mut hex = String::with_capacity(2 * bytes.len());
-    for b in bytes {
-        let _ = write!(hex, "{b:02x}");
+    for &b in bytes {
+        hex.push(char::from(HEX_DIGITS[usize::from(b >> 4)]));
+        hex.push(char::from(HEX_DIGITS[usize::from(b & 0x0f)]));
     }
     hex
+}
+
+/// Lowercase hex of a SHA-256 digest, built on the stack.
+fn digest_hex(digest: &[u8; 32]) -> [u8; 64] {
+    let mut hex = [0u8; 64];
+    for (pair, &b) in hex.chunks_exact_mut(2).zip(digest) {
+        pair[0] = HEX_DIGITS[usize::from(b >> 4)];
+        pair[1] = HEX_DIGITS[usize::from(b & 0x0f)];
+    }
+    hex
+}
+
+fn hex_string(hex: [u8; 64]) -> String {
+    hex.iter().map(|&b| char::from(b)).collect()
 }
 
 /// Domain tag prepended to the event hash before signing, so an Argus signature can neither be
@@ -250,13 +266,10 @@ pub fn sign_event_hash_ed25519(event_hash: &str, private_key_bytes: &[u8; 32]) -
 pub fn sign_event_hash(signing_key: &ed25519_dalek::SigningKey, event_hash: &str) -> String {
     use ed25519_dalek::Signer;
     let signature = signing_key.sign(&[SIGNATURE_DOMAIN, event_hash.as_bytes()].concat());
-    let sig_bytes = signature.to_bytes();
-    let mut hex = String::with_capacity(sig_bytes.len() * 2 + 8);
-    hex.push_str("ed25519:");
-    for b in sig_bytes {
-        hex.push_str(&format!("{:02x}", b));
-    }
-    hex
+    let mut encoded = String::with_capacity(8 + 2 * ed25519_dalek::SIGNATURE_LENGTH);
+    encoded.push_str("ed25519:");
+    encoded.push_str(&hex_lower(&signature.to_bytes()));
+    encoded
 }
 
 /// Verify an event-hash signature. Only the lowercase-hex `ed25519:` encoding is accepted, and
@@ -308,9 +321,13 @@ const PAYLOAD_HASH_DOMAIN: &[u8] = b"argus.payload.v2\0";
 
 /// SHA-256 of `payload` under its own domain tag; event hashes commit to this digest.
 pub fn compute_payload_digest(payload: &str) -> String {
+    hex_string(payload_digest_hex(payload))
+}
+
+fn payload_digest_hex(payload: &str) -> [u8; 64] {
     let mut hasher = Sha256::new_with_prefix(PAYLOAD_HASH_DOMAIN);
     hasher.update(payload);
-    hex_lower(&hasher.finalize())
+    digest_hex(&hasher.finalize().into())
 }
 
 /// Compute the SHA-256 event hash over an injective encoding: a domain tag, the big-endian
@@ -325,10 +342,10 @@ pub fn compute_event_hash(
     prev_hash: &str,
     payload: &str,
 ) -> String {
-    let digest = compute_payload_digest(payload);
-    compute_event_hash_from_digest(
+    let digest = payload_digest_hex(payload);
+    hex_string(event_hash_hex(
         sequence, event_id, timestamp, event_type, actor, prev_hash, &digest,
-    )
+    ))
 }
 
 /// [`compute_event_hash`] for a precomputed [`compute_payload_digest`]: O(header) work.
@@ -341,13 +358,42 @@ pub fn compute_event_hash_from_digest(
     prev_hash: &str,
     digest: &str,
 ) -> String {
+    hex_string(event_hash_hex(
+        sequence,
+        event_id,
+        timestamp,
+        event_type,
+        actor,
+        prev_hash,
+        digest.as_bytes(),
+    ))
+}
+
+/// The v2 event hash as lowercase hex on the stack: no heap allocation per event.
+fn event_hash_hex(
+    sequence: u64,
+    event_id: &str,
+    timestamp: &str,
+    event_type: &str,
+    actor: &str,
+    prev_hash: &str,
+    digest: &[u8],
+) -> [u8; 64] {
     let mut hasher = Sha256::new_with_prefix(EVENT_HASH_DOMAIN);
     hasher.update(sequence.to_be_bytes());
-    for field in [event_id, timestamp, event_type, actor, prev_hash, digest] {
+    let fields = [
+        event_id.as_bytes(),
+        timestamp.as_bytes(),
+        event_type.as_bytes(),
+        actor.as_bytes(),
+        prev_hash.as_bytes(),
+        digest,
+    ];
+    for field in fields {
         hasher.update((field.len() as u64).to_be_bytes());
         hasher.update(field);
     }
-    hex_lower(&hasher.finalize())
+    digest_hex(&hasher.finalize().into())
 }
 
 /// Largest `payload` accepted by `append`, bounding per-event memory and hashing work.
@@ -405,15 +451,45 @@ pub fn validate_canonical_payload(payload: &str) -> Result<(), LedgerError> {
     if !value.is_object() || !canonical(&value) {
         return Err(invalid("must be a sorted-key object with safe integers"));
     }
-    if serde_json::to_string(&value).ok().as_deref() != Some(payload) {
+    // Re-serialize into a comparing sink rather than a second O(payload) buffer.
+    let mut sink = MatchesWriter {
+        expected: payload.as_bytes(),
+        matches: true,
+    };
+    let serialized = serde_json::to_writer(&mut sink, &value).is_ok();
+    if !(serialized && sink.matches && sink.expected.is_empty()) {
         return Err(invalid("is not in canonical form"));
     }
     Ok(())
 }
 
+/// `io::Write` sink that checks the bytes written to it against `expected` without storing them.
+struct MatchesWriter<'a> {
+    /// The suffix of the expected output not yet matched.
+    expected: &'a [u8],
+    matches: bool,
+}
+
+impl std::io::Write for MatchesWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.matches {
+            match self.expected.strip_prefix(buf) {
+                Some(rest) => self.expected = rest,
+                None => self.matches = false,
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Parse a decimal `u64` in canonical form (no sign, no leading zeros).
 fn parse_canonical_u64(s: &str) -> Option<u64> {
-    s.parse().ok().filter(|v: &u64| v.to_string() == s)
+    let canonical = s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
+    canonical.then(|| s.parse().ok()).flatten()
 }
 
 /// Thread-safe in-memory reference implementation of an append-only audit ledger.
@@ -430,7 +506,7 @@ impl Default for InMemoryLedger {
     fn default() -> Self {
         let mut id = [0u8; 16];
         getrandom::getrandom(&mut id).expect("OS RNG unavailable; cannot derive a ledger identity");
-        let ledger_id: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        let ledger_id = hex_lower(&id);
         Self {
             events: Arc::default(),
             signing_key: None,
@@ -488,7 +564,7 @@ impl AuditLedgerWriter for InMemoryLedger {
             .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
             .ok_or_else(|| LedgerError::InvalidTimestamp("clock outside 1970-2554".into()))?;
         // All O(payload) work (hashing, copying) happens before the lock is taken.
-        let digest = compute_payload_digest(payload);
+        let digest = payload_digest_hex(payload);
         let payload = payload.to_owned();
         let mut store = self.store();
         let sequence = (store.len() as u64) + 1;
@@ -506,9 +582,9 @@ impl AuditLedgerWriter for InMemoryLedger {
             .to_string();
         let event_id = format!("ev_{}_{}", self.ledger_id, sequence);
 
-        let event_hash = compute_event_hash_from_digest(
+        let event_hash = hex_string(event_hash_hex(
             sequence, &event_id, &timestamp, event_type, actor, &prev_hash, &digest,
-        );
+        ));
         let signature = self
             .signing_key
             .as_deref()
@@ -611,7 +687,7 @@ impl VerificationPolicy {
             failure: Some(error),
             checked_at: checked_at.clone(),
         };
-        let mut expected_prev = GENESIS_PREV_HASH.to_string();
+        let mut expected_prev: &str = GENESIS_PREV_HASH;
         let mut prev_timestamp: Option<u64> = None;
         for (idx, event) in events.iter().enumerate() {
             let seq = (idx as u64) + 1;
@@ -623,16 +699,16 @@ impl VerificationPolicy {
                 let detail = format!("broken prev_hash link at sequence {seq}");
                 return Ok(fail(seq, LedgerError::HashMismatch(detail)));
             }
-            let expected_hash = compute_event_hash(
+            let expected_hash = event_hash_hex(
                 event.sequence,
                 &event.event_id,
                 &event.timestamp,
                 &event.event_type,
                 &event.actor,
                 &event.prev_hash,
-                &event.payload,
+                &payload_digest_hex(&event.payload),
             );
-            if event.event_hash != expected_hash {
+            if event.event_hash.as_bytes() != expected_hash.as_slice() {
                 let detail = format!("tampered content hash at sequence {seq}");
                 return Ok(fail(seq, LedgerError::HashMismatch(detail)));
             }
@@ -652,7 +728,7 @@ impl VerificationPolicy {
                     return Ok(fail(seq, LedgerError::InvalidSignature(detail)));
                 }
             }
-            expected_prev = event.event_hash.clone();
+            expected_prev = &event.event_hash;
         }
 
         if let Some(anchor) = &self.anchor {
@@ -694,7 +770,9 @@ mod tests {
     #[test]
     fn test_empty_ledger_verification() {
         let ledger = InMemoryLedger::new();
-        let report = ledger.verify_chain().expect("Empty chain should verify without panicking");
+        let report = ledger
+            .verify_chain()
+            .expect("Empty chain should verify without panicking");
         assert!(report.valid);
         assert_eq!(report.total_events, 0);
         assert_eq!(report.root_hash, "");
@@ -733,7 +811,11 @@ mod tests {
         assert!(sig.starts_with("ed25519:"));
 
         assert!(verify_event_hash_ed25519(event_hash, &sig, &pub_bytes));
-        assert!(!verify_event_hash_ed25519("tampered_hash", &sig, &pub_bytes));
+        assert!(!verify_event_hash_ed25519(
+            "tampered_hash",
+            &sig,
+            &pub_bytes
+        ));
     }
 }
 
