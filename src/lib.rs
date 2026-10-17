@@ -329,7 +329,19 @@ pub fn verify_event_hash_ed25519(event_hash: &str, signature_hex: &str, public_k
     verifying_key.verify(event_hash.as_bytes(), &signature).is_ok()
 }
 
-/// Compute the canonical SHA-256 event hash across all event metadata and payload fields.
+/// Domain tag for event-hash preimages (hash format v2).
+const EVENT_HASH_DOMAIN: &[u8] = b"argus.event.v2\0";
+/// Domain tag for payload digests (hash format v2).
+const PAYLOAD_HASH_DOMAIN: &[u8] = b"argus.payload.v2\0";
+
+/// SHA-256 of `payload` under its own domain tag; event hashes commit to this digest.
+pub fn compute_payload_digest(payload: &str) -> String {
+    sha256_hex(&[PAYLOAD_HASH_DOMAIN, payload.as_bytes()].concat())
+}
+
+/// Compute the SHA-256 event hash over an injective encoding: a domain tag, the big-endian
+/// sequence, then each variable-length field prefixed by its big-endian u64 byte length, the
+/// last field being the payload digest.
 pub fn compute_event_hash(
     sequence: u64,
     event_id: &str,
@@ -339,11 +351,15 @@ pub fn compute_event_hash(
     prev_hash: &str,
     payload: &str,
 ) -> String {
-    let header = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        sequence, event_id, timestamp, event_type, actor, prev_hash, payload
-    );
-    sha256_hex(header.as_bytes())
+    let digest = compute_payload_digest(payload);
+    let fields: [&str; 6] = [event_id, timestamp, event_type, actor, prev_hash, &digest];
+    let mut preimage = EVENT_HASH_DOMAIN.to_vec();
+    preimage.extend_from_slice(&sequence.to_be_bytes());
+    for field in fields {
+        preimage.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(field.as_bytes());
+    }
+    sha256_hex(&preimage)
 }
 
 /// Thread-safe in-memory reference implementation of an append-only audit ledger.
