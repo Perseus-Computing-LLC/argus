@@ -231,3 +231,29 @@ fn f5_only_canonical_payloads_are_recorded() {
         ledger.append("tool.exec", "worker_1", accepted).unwrap();
     }
 }
+
+#[test]
+fn f6_failures_are_positional_typed_and_fail_closed() {
+    let ledger = ledger_with(2);
+    let mut events = ledger.all_events().unwrap();
+    events[1].sequence = u64::MAX;
+    let report = VerificationPolicy::default().verify(&events).unwrap();
+    assert_eq!(
+        report.first_broken_sequence,
+        Some(2),
+        "position, not the stored value"
+    );
+    assert!(matches!(
+        report.ensure_valid(),
+        Err(LedgerError::SequenceDiscontinuity(_))
+    ));
+
+    let mut events = ledger.all_events().unwrap();
+    events[0].payload = "{\"x\":1}".into();
+    let report = VerificationPolicy::default().verify(&events).unwrap();
+    assert!(matches!(
+        report.ensure_valid(),
+        Err(LedgerError::HashMismatch(_))
+    ));
+    assert!(ledger.verify_chain().unwrap().ensure_valid().is_ok());
+}

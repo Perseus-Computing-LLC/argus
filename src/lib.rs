@@ -85,6 +85,7 @@ pub struct AuditEvent {
 
 /// Cryptographic integrity verification report for an event chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "tampering is reported as `Ok` with `valid == false`; call `ensure_valid()`"]
 pub struct ChainVerificationReport {
     /// True if all sequence numbers, previous hashes, and event hashes match expectations.
     pub valid: bool,
@@ -94,10 +95,12 @@ pub struct ChainVerificationReport {
     pub root_hash: String,
     /// Event hash of the most recent event in the ledger.
     pub head_hash: String,
-    /// Sequence number of the first detected discrepancy, or None if valid.
+    /// 1-based chain position of the first discrepancy (never a value read from the record).
     pub first_broken_sequence: Option<u64>,
     /// Human-readable explanation of detected tampering or discontinuity.
     pub error_detail: Option<String>,
+    /// Typed failure, or None if valid.
+    pub failure: Option<LedgerError>,
     /// Timestamp when verification was completed in seconds since UNIX epoch.
     pub checked_at: String,
 }
@@ -134,6 +137,17 @@ impl AuditEvent {
     }
 }
 
+impl ChainVerificationReport {
+    /// Fail closed: `Ok(self)` only if verification passed, otherwise the typed failure.
+    pub fn ensure_valid(self) -> Result<Self, LedgerError> {
+        if self.valid {
+            return Ok(self);
+        }
+        let detail = self.error_detail.unwrap_or_default();
+        Err(self.failure.unwrap_or(LedgerError::HashMismatch(detail)))
+    }
+}
+
 /// Errors returned during ledger append, retrieval, or verification operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -146,6 +160,8 @@ pub enum LedgerError {
     LockError(String),
     /// `append` input rejected before anything was recorded.
     InvalidInput(String),
+    /// A required event signature is missing or does not verify.
+    InvalidSignature(String),
 }
 
 impl std::fmt::Display for LedgerError {
@@ -155,6 +171,7 @@ impl std::fmt::Display for LedgerError {
             Self::HashMismatch(msg) => write!(f, "Hash mismatch: {}", msg),
             Self::LockError(msg) => write!(f, "Lock error: {}", msg),
             Self::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
+            Self::InvalidSignature(msg) => write!(f, "Invalid signature: {}", msg),
         }
     }
 }
@@ -562,6 +579,7 @@ impl VerificationPolicy {
                 head_hash: String::new(),
                 first_broken_sequence: None,
                 error_detail: None,
+                failure: None,
                 checked_at,
             });
         }
@@ -574,36 +592,28 @@ impl VerificationPolicy {
             .last()
             .map(|e| e.event_hash.clone())
             .unwrap_or_default();
+        // `position` is computed by the verifier, never read from the record under test.
+        let fail = |position: u64, error: LedgerError| ChainVerificationReport {
+            valid: false,
+            total_events: events.len(),
+            root_hash: root_hash.clone(),
+            head_hash: head_hash.clone(),
+            first_broken_sequence: Some(position),
+            error_detail: Some(error.to_string()),
+            failure: Some(error),
+            checked_at: checked_at.clone(),
+        };
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
         for (idx, event) in events.iter().enumerate() {
-            let expected_seq = (idx as u64) + 1;
-            if event.sequence != expected_seq {
-                return Ok(ChainVerificationReport {
-                    valid: false,
-                    total_events: events.len(),
-                    root_hash: root_hash.clone(),
-                    head_hash: head_hash.clone(),
-                    first_broken_sequence: Some(event.sequence),
-                    error_detail: Some(format!("Discontinuous sequence at index {}", idx)),
-                    checked_at,
-                });
+            let seq = (idx as u64) + 1;
+            if event.sequence != seq {
+                let detail = format!("position {seq} records sequence {}", event.sequence);
+                return Ok(fail(seq, LedgerError::SequenceDiscontinuity(detail)));
             }
-
             if event.prev_hash != expected_prev {
-                return Ok(ChainVerificationReport {
-                    valid: false,
-                    total_events: events.len(),
-                    root_hash: root_hash.clone(),
-                    head_hash: head_hash.clone(),
-                    first_broken_sequence: Some(event.sequence),
-                    error_detail: Some(format!(
-                        "Broken prev_hash chain at sequence {}",
-                        event.sequence
-                    )),
-                    checked_at,
-                });
+                let detail = format!("broken prev_hash link at sequence {seq}");
+                return Ok(fail(seq, LedgerError::HashMismatch(detail)));
             }
-
             let expected_hash = compute_event_hash(
                 event.sequence,
                 &event.event_id,
@@ -613,42 +623,19 @@ impl VerificationPolicy {
                 &event.prev_hash,
                 &event.payload,
             );
-
             if event.event_hash != expected_hash {
-                return Ok(ChainVerificationReport {
-                    valid: false,
-                    total_events: events.len(),
-                    root_hash: root_hash.clone(),
-                    head_hash: head_hash.clone(),
-                    first_broken_sequence: Some(event.sequence),
-                    error_detail: Some(format!(
-                        "Tampered content hash at sequence {}",
-                        event.sequence
-                    )),
-                    checked_at,
-                });
+                let detail = format!("tampered content hash at sequence {seq}");
+                return Ok(fail(seq, LedgerError::HashMismatch(detail)));
             }
-
             if let Some(key) = &self.verifying_key {
                 let signed = event.signature.as_deref().is_some_and(|signature| {
                     verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
                 });
                 if !signed {
-                    return Ok(ChainVerificationReport {
-                        valid: false,
-                        total_events: events.len(),
-                        root_hash: root_hash.clone(),
-                        head_hash: head_hash.clone(),
-                        first_broken_sequence: Some(event.sequence),
-                        error_detail: Some(format!(
-                            "Missing or invalid signature at sequence {}",
-                            event.sequence
-                        )),
-                        checked_at,
-                    });
+                    let detail = format!("missing or invalid signature at sequence {seq}");
+                    return Ok(fail(seq, LedgerError::InvalidSignature(detail)));
                 }
             }
-
             expected_prev = event.event_hash.clone();
         }
 
@@ -658,18 +645,8 @@ impl VerificationPolicy {
                 .and_then(|n| n.checked_sub(1))
                 .and_then(|i| events.get(i));
             if witnessed.map(|e| &e.event_hash) != Some(&anchor.event_hash) {
-                return Ok(ChainVerificationReport {
-                    valid: false,
-                    total_events: events.len(),
-                    root_hash,
-                    head_hash,
-                    first_broken_sequence: Some(anchor.sequence),
-                    error_detail: Some(format!(
-                        "Chain does not contain anchored event {} ({})",
-                        anchor.sequence, anchor.event_hash
-                    )),
-                    checked_at,
-                });
+                let detail = format!("chain does not contain anchored event {}", anchor.sequence);
+                return Ok(fail(anchor.sequence, LedgerError::HashMismatch(detail)));
             }
         }
 
@@ -680,6 +657,7 @@ impl VerificationPolicy {
             head_hash,
             first_broken_sequence: None,
             error_detail: None,
+            failure: None,
             checked_at,
         })
     }
