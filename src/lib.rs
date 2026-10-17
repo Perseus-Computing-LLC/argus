@@ -102,6 +102,35 @@ pub struct ChainVerificationReport {
     pub checked_at: String,
 }
 
+/// Externally witnessed commitment to one chain position, such as a head published to a
+/// transparency log or held by another trust domain. It is evidence only if the ledger's writer
+/// cannot rewrite the place it was obtained from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainAnchor {
+    /// Sequence number of the witnessed event.
+    pub sequence: u64,
+    /// `event_hash` of the witnessed event.
+    pub event_hash: String,
+}
+
+/// Trust inputs that the chain under verification cannot supply for itself.
+#[derive(Debug, Clone, Default)]
+pub struct VerificationPolicy {
+    /// If set, the chain must contain this event unchanged. Detects rollback, truncation below
+    /// the anchor, and recomputed history; events appended after it remain unwitnessed.
+    pub anchor: Option<ChainAnchor>,
+}
+
+impl AuditEvent {
+    /// Commitment to this event's chain position, for publication to an external witness.
+    pub fn anchor(&self) -> ChainAnchor {
+        ChainAnchor {
+            sequence: self.sequence,
+            event_hash: self.event_hash.clone(),
+        }
+    }
+}
+
 /// Errors returned during ledger append, retrieval, or verification operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LedgerError {
@@ -148,8 +177,18 @@ pub trait AuditLedgerReader: Send + Sync {
 
 /// Trait defining full-chain cryptographic audit verification.
 pub trait AuditVerifier: Send + Sync {
-    /// Traverse the ledger from genesis to head, verifying all hashes and sequence numbers.
-    fn verify_chain(&self) -> Result<ChainVerificationReport, LedgerError>;
+    /// Internal consistency only: an empty, truncated, or recomputed chain passes. Tamper
+    /// evidence requires [`AuditVerifier::verify_chain_with`] and an anchor.
+    fn verify_chain(&self) -> Result<ChainVerificationReport, LedgerError> {
+        self.verify_chain_with(&VerificationPolicy::default())
+    }
+
+    /// Traverse the ledger from genesis to head, verifying all hashes and sequence numbers
+    /// against the externally supplied trust inputs in `policy`.
+    fn verify_chain_with(
+        &self,
+        policy: &VerificationPolicy,
+    ) -> Result<ChainVerificationReport, LedgerError>;
 }
 
 /// Standalone, pure-Rust SHA-256 implementation (FIPS 180-4 compliant, zero external dependencies).
@@ -397,18 +436,29 @@ impl AuditLedgerReader for InMemoryLedger {
 }
 
 impl AuditVerifier for InMemoryLedger {
-    fn verify_chain(&self) -> Result<ChainVerificationReport, LedgerError> {
+    fn verify_chain_with(
+        &self,
+        policy: &VerificationPolicy,
+    ) -> Result<ChainVerificationReport, LedgerError> {
         let store = self
             .events
             .lock()
             .map_err(|e| LedgerError::LockError(e.to_string()))?;
+        policy.verify(&store)
+    }
+}
+
+impl VerificationPolicy {
+    /// Verify an exported or persisted event sequence, such as the output of `all_events()`.
+    /// Without `self.anchor` this proves internal consistency only.
+    pub fn verify(&self, events: &[AuditEvent]) -> Result<ChainVerificationReport, LedgerError> {
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let checked_at = format!("{}", now_sec);
 
-        if store.is_empty() {
+        if events.is_empty() && self.anchor.is_none() {
             return Ok(ChainVerificationReport {
                 valid: true,
                 total_events: 0,
@@ -420,15 +470,21 @@ impl AuditVerifier for InMemoryLedger {
             });
         }
 
-        let root_hash = store.first().map(|e| e.event_hash.clone()).unwrap_or_default();
-        let head_hash = store.last().map(|e| e.event_hash.clone()).unwrap_or_default();
+        let root_hash = events
+            .first()
+            .map(|e| e.event_hash.clone())
+            .unwrap_or_default();
+        let head_hash = events
+            .last()
+            .map(|e| e.event_hash.clone())
+            .unwrap_or_default();
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
-        for (idx, event) in store.iter().enumerate() {
+        for (idx, event) in events.iter().enumerate() {
             let expected_seq = (idx as u64) + 1;
             if event.sequence != expected_seq {
                 return Ok(ChainVerificationReport {
                     valid: false,
-                    total_events: store.len(),
+                    total_events: events.len(),
                     root_hash: root_hash.clone(),
                     head_hash: head_hash.clone(),
                     first_broken_sequence: Some(event.sequence),
@@ -440,7 +496,7 @@ impl AuditVerifier for InMemoryLedger {
             if event.prev_hash != expected_prev {
                 return Ok(ChainVerificationReport {
                     valid: false,
-                    total_events: store.len(),
+                    total_events: events.len(),
                     root_hash: root_hash.clone(),
                     head_hash: head_hash.clone(),
                     first_broken_sequence: Some(event.sequence),
@@ -465,7 +521,7 @@ impl AuditVerifier for InMemoryLedger {
             if event.event_hash != expected_hash {
                 return Ok(ChainVerificationReport {
                     valid: false,
-                    total_events: store.len(),
+                    total_events: events.len(),
                     root_hash: root_hash.clone(),
                     head_hash: head_hash.clone(),
                     first_broken_sequence: Some(event.sequence),
@@ -480,9 +536,30 @@ impl AuditVerifier for InMemoryLedger {
             expected_prev = event.event_hash.clone();
         }
 
+        if let Some(anchor) = &self.anchor {
+            let witnessed = usize::try_from(anchor.sequence)
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| events.get(i));
+            if witnessed.map(|e| &e.event_hash) != Some(&anchor.event_hash) {
+                return Ok(ChainVerificationReport {
+                    valid: false,
+                    total_events: events.len(),
+                    root_hash,
+                    head_hash,
+                    first_broken_sequence: Some(anchor.sequence),
+                    error_detail: Some(format!(
+                        "Chain does not contain anchored event {} ({})",
+                        anchor.sequence, anchor.event_hash
+                    )),
+                    checked_at,
+                });
+            }
+        }
+
         Ok(ChainVerificationReport {
             valid: true,
-            total_events: store.len(),
+            total_events: events.len(),
             root_hash,
             head_hash,
             first_broken_sequence: None,
@@ -549,3 +626,6 @@ mod tests {
         assert!(!verify_event_hash_ed25519("tampered_hash", &sig, &pub_bytes));
     }
 }
+
+#[cfg(test)]
+mod remediation_tests;
