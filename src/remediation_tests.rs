@@ -257,3 +257,36 @@ fn f6_failures_are_positional_typed_and_fail_closed() {
     ));
     assert!(ledger.verify_chain().unwrap().ensure_valid().is_ok());
 }
+
+#[test]
+fn f7_ledger_identity_resolution_and_monotonic_time() {
+    let (mut a, mut b) = (InMemoryLedger::new(), InMemoryLedger::new());
+    let ea = a.append("tool.exec", "worker_1", "{}").unwrap();
+    let eb = b.append("tool.exec", "worker_1", "{}").unwrap();
+    assert_ne!(ea.event_id, eb.event_id);
+    assert_ne!(ea.event_hash, eb.event_hash);
+
+    let stamps: Vec<u64> = (0..1000)
+        .map(|_| {
+            a.append("tool.exec", "worker_1", "{}")
+                .unwrap()
+                .timestamp
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        stamps.windows(2).all(|w| w[0] < w[1]),
+        "strictly increasing"
+    );
+    assert!(a.verify_chain().unwrap().valid);
+
+    let mut events = a.all_events().unwrap();
+    events.last_mut().unwrap().timestamp = "0".into();
+    relink(&mut events);
+    let report = VerificationPolicy::default().verify(&events).unwrap();
+    assert!(matches!(
+        report.failure,
+        Some(LedgerError::InvalidTimestamp(_))
+    ));
+}

@@ -65,9 +65,9 @@ pub const GENESIS_PREV_HASH: &str =
 pub struct AuditEvent {
     /// Monotonically increasing sequence number starting at 1.
     pub sequence: u64,
-    /// Unique event identifier string.
+    /// `ev_{ledger_id}_{sequence}`, where `ledger_id` is the ledger's random 128-bit identity.
     pub event_id: String,
-    /// Event timestamp in seconds since UNIX epoch.
+    /// Nanoseconds since the UNIX epoch; strictly increasing along the chain.
     pub timestamp: String,
     /// Dot-separated action taxonomy (for example: agent.startup, tool.exec).
     pub event_type: String,
@@ -162,6 +162,8 @@ pub enum LedgerError {
     InvalidInput(String),
     /// A required event signature is missing or does not verify.
     InvalidSignature(String),
+    /// The host clock is unusable, or a recorded timestamp is malformed or out of order.
+    InvalidTimestamp(String),
 }
 
 impl std::fmt::Display for LedgerError {
@@ -172,6 +174,7 @@ impl std::fmt::Display for LedgerError {
             Self::LockError(msg) => write!(f, "Lock error: {}", msg),
             Self::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             Self::InvalidSignature(msg) => write!(f, "Invalid signature: {}", msg),
+            Self::InvalidTimestamp(msg) => write!(f, "Invalid timestamp: {}", msg),
         }
     }
 }
@@ -445,11 +448,32 @@ pub fn validate_canonical_payload(payload: &str) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Parse a decimal `u64` in canonical form (no sign, no leading zeros).
+fn parse_canonical_u64(s: &str) -> Option<u64> {
+    s.parse().ok().filter(|v: &u64| v.to_string() == s)
+}
+
 /// Thread-safe in-memory reference implementation of an append-only audit ledger.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct InMemoryLedger {
     events: Arc<Mutex<Vec<AuditEvent>>>,
     signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    /// Random per-instance identity bound into every `event_id`, so two ledgers (or one ledger
+    /// across a restart) never produce interchangeable events.
+    ledger_id: Arc<str>,
+}
+
+impl Default for InMemoryLedger {
+    fn default() -> Self {
+        let mut id = [0u8; 16];
+        getrandom::getrandom(&mut id).expect("OS RNG unavailable; cannot derive a ledger identity");
+        let ledger_id: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        Self {
+            events: Arc::default(),
+            signing_key: None,
+            ledger_id: ledger_id.into(),
+        }
+    }
 }
 
 impl InMemoryLedger {
@@ -475,6 +499,11 @@ impl AuditLedgerWriter for InMemoryLedger {
         payload: &str,
     ) -> Result<AuditEvent, LedgerError> {
         validate_canonical_payload(payload)?;
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
+            .ok_or_else(|| LedgerError::InvalidTimestamp("clock outside 1970-2554".into()))?;
         let mut store = self
             .events
             .lock()
@@ -486,12 +515,13 @@ impl AuditLedgerWriter for InMemoryLedger {
             GENESIS_PREV_HASH.to_string()
         };
 
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let timestamp = format!("{}", now_sec);
-        let event_id = format!("ev_{}_{}", sequence, now_sec);
+        // Strictly increasing within the ledger, even if the host clock steps backwards.
+        let timestamp = store
+            .last()
+            .and_then(|last| last.timestamp.parse::<u64>().ok())
+            .map_or(now_ns, |last_ns| now_ns.max(last_ns.saturating_add(1)))
+            .to_string();
+        let event_id = format!("ev_{}_{}", self.ledger_id, sequence);
 
         let event_hash = compute_event_hash(
             sequence, &event_id, &timestamp, event_type, actor, &prev_hash, payload,
@@ -604,6 +634,7 @@ impl VerificationPolicy {
             checked_at: checked_at.clone(),
         };
         let mut expected_prev = GENESIS_PREV_HASH.to_string();
+        let mut prev_timestamp: Option<u64> = None;
         for (idx, event) in events.iter().enumerate() {
             let seq = (idx as u64) + 1;
             if event.sequence != seq {
@@ -627,6 +658,13 @@ impl VerificationPolicy {
                 let detail = format!("tampered content hash at sequence {seq}");
                 return Ok(fail(seq, LedgerError::HashMismatch(detail)));
             }
+            let Some(timestamp) = parse_canonical_u64(&event.timestamp)
+                .filter(|&ns| prev_timestamp.is_none_or(|prev| ns > prev))
+            else {
+                let detail = format!("timestamp at sequence {seq} is malformed or not increasing");
+                return Ok(fail(seq, LedgerError::InvalidTimestamp(detail)));
+            };
+            prev_timestamp = Some(timestamp);
             if let Some(key) = &self.verifying_key {
                 let signed = event.signature.as_deref().is_some_and(|signature| {
                     verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
