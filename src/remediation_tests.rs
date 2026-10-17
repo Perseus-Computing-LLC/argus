@@ -1,10 +1,9 @@
 //! Regression tests for the remediation series; each stage appends the tests for its finding.
-#![allow(unused_mut)] // stages before F12 still take `&mut self` in `append`
 #[allow(unused_imports)]
 use super::*;
 
 fn ledger_with(n: usize) -> InMemoryLedger {
-    let mut ledger = InMemoryLedger::new();
+    let ledger = InMemoryLedger::new();
     for i in 0..n {
         ledger
             .append("tool.exec", "worker_1", &format!("{{\"step\":{i}}}"))
@@ -40,7 +39,7 @@ fn anchored_at_head(ledger: &InMemoryLedger) -> VerificationPolicy {
 
 #[test]
 fn f1_anchor_rejects_rollback_truncation_and_recomputed_history() {
-    let mut ledger = ledger_with(3);
+    let ledger = ledger_with(3);
     let policy = anchored_at_head(&ledger);
     let honest = ledger.all_events().unwrap();
     assert!(ledger.verify_chain_with(&policy).unwrap().valid);
@@ -93,7 +92,7 @@ fn f2_field_boundaries_are_bound_into_the_hash() {
             "{}"
         ),
     );
-    let mut ledger = InMemoryLedger::new();
+    let ledger = InMemoryLedger::new();
     let actor = "svc-ci:on-behalf-of:alice";
     ledger
         .append("policy.override", actor, "{\"rule\":\"prod-freeze\"}")
@@ -141,7 +140,7 @@ fn f2_v2_golden_vectors_match_an_independent_python_implementation() {
 #[test]
 fn f3_signed_ledger_rejects_stripped_forged_and_foreign_signatures() {
     let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-    let mut ledger = InMemoryLedger::with_signing_key(key.clone());
+    let ledger = InMemoryLedger::with_signing_key(key.clone());
     let ev = ledger.append("tool.exec", "worker_1", "{}").unwrap();
     assert!(ev.signature.is_some(), "append signs");
     let policy = VerificationPolicy {
@@ -202,7 +201,7 @@ fn f4_weak_keys_noncanonical_hex_and_untagged_signatures_are_rejected() {
 
 #[test]
 fn f5_only_canonical_payloads_are_recorded() {
-    let mut ledger = InMemoryLedger::new();
+    let ledger = InMemoryLedger::new();
     for rejected in [
         "{\"b\":2,\"a\":1}",
         "{\"a\": 1, \"b\": 2}",
@@ -260,7 +259,7 @@ fn f6_failures_are_positional_typed_and_fail_closed() {
 
 #[test]
 fn f7_ledger_identity_resolution_and_monotonic_time() {
-    let (mut a, mut b) = (InMemoryLedger::new(), InMemoryLedger::new());
+    let (a, b) = (InMemoryLedger::new(), InMemoryLedger::new());
     let ea = a.append("tool.exec", "worker_1", "{}").unwrap();
     let eb = b.append("tool.exec", "worker_1", "{}").unwrap();
     assert_ne!(ea.event_id, eb.event_id);
@@ -293,7 +292,7 @@ fn f7_ledger_identity_resolution_and_monotonic_time() {
 
 #[test]
 fn f8_identifiers_and_payload_size_are_validated_before_recording() {
-    let mut ledger = InMemoryLedger::new();
+    let ledger = InMemoryLedger::new();
     for (event_type, actor) in [
         ("", "worker_1"),
         ("tool.exec", ""),
@@ -321,7 +320,7 @@ fn f8_identifiers_and_payload_size_are_validated_before_recording() {
 
 #[test]
 fn f9_appends_proceed_while_a_large_chain_is_verified() {
-    let mut ledger = InMemoryLedger::new();
+    let ledger = InMemoryLedger::new();
     let blob = format!("{{\"blob\":\"{}\"}}", "a".repeat(MAX_PAYLOAD_BYTES - 16));
     for _ in 0..32 {
         ledger.append("bulk.ingest", "worker_1", &blob).unwrap();
@@ -349,7 +348,7 @@ fn f9_appends_proceed_while_a_large_chain_is_verified() {
 
 #[test]
 fn f10_poisoned_lock_is_recovered_without_data_loss() {
-    let mut ledger = ledger_with(1);
+    let ledger = ledger_with(1);
     let shared = ledger.clone();
     let _ = std::thread::spawn(move || {
         let _guard = shared.events.lock().unwrap();
@@ -417,4 +416,73 @@ fn f11_hashing_streams_without_copying_the_input() {
     let payload = format!("{{\"blob\":\"{}\"}}", "a".repeat(1 << 20));
     let (_, peak) = probe::peak_during(|| compute_payload_digest(&payload));
     assert!(peak <= 128, "compute_payload_digest(1 MiB) peak {peak} B");
+}
+
+#[test]
+fn f12_one_ledger_is_shared_across_threads_without_an_outer_lock() {
+    let ledger = Arc::new(InMemoryLedger::new());
+    let workers: Vec<_> = (0..8)
+        .map(|i| {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    ledger
+                        .append("tool.exec", &format!("agent_{i}"), "{}")
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(ledger.all_events().unwrap().len(), 400);
+    assert!(ledger.verify_chain().unwrap().valid);
+}
+
+#[test]
+#[ignore = "timing harness; run with --release -- --ignored --nocapture"]
+fn measure_fixed_lock_hold() {
+    use std::time::{Duration, Instant};
+    let ledger = Arc::new(InMemoryLedger::new());
+    let blob = format!("{{\"blob\":\"{}\"}}", "a".repeat(MAX_PAYLOAD_BYTES - 16));
+    for _ in 0..64 {
+        ledger.append("bulk.ingest", "worker_1", &blob).unwrap();
+    }
+
+    let writer = {
+        let (ledger, blob) = (Arc::clone(&ledger), blob.clone());
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            for _ in 0..32 {
+                ledger.append("bulk.ingest", "worker_1", &blob).unwrap();
+            }
+            started.elapsed() / 32
+        })
+    };
+    let mut worst_head = Duration::ZERO;
+    while !writer.is_finished() {
+        let started = Instant::now();
+        let _ = ledger.head().unwrap();
+        worst_head = worst_head.max(started.elapsed());
+    }
+    let per_append = writer.join().unwrap();
+    println!(
+        "[measure-fixed] 1 MiB append avg {per_append:?}; worst head() meanwhile {worst_head:?}"
+    );
+
+    let reader = Arc::clone(&ledger);
+    let verifier = std::thread::spawn(move || {
+        let started = Instant::now();
+        assert!(reader.verify_chain().unwrap().valid);
+        started.elapsed()
+    });
+    let mut worst_append = Duration::ZERO;
+    while !verifier.is_finished() {
+        let started = Instant::now();
+        ledger.append("tool.exec", "worker_1", "{}").unwrap();
+        worst_append = worst_append.max(started.elapsed());
+    }
+    let verify_time = verifier.join().unwrap();
+    println!("[measure-fixed] verify_chain(96 x 1 MiB) {verify_time:?}; worst 2-byte append meanwhile {worst_append:?}");
 }

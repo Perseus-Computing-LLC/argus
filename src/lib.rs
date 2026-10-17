@@ -30,7 +30,7 @@
 //! use argus_ledger::{AuditLedgerReader, AuditLedgerWriter, AuditVerifier, InMemoryLedger, GENESIS_PREV_HASH};
 //!
 //! // Create an in-memory audit ledger
-//! let mut ledger = InMemoryLedger::new();
+//! let ledger = InMemoryLedger::new();
 //!
 //! // 1. Record an initial initialization event
 //! let ev1 = ledger.append("agent.startup", "coordinator", "{\"status\":\"initialized\"}")
@@ -185,9 +185,10 @@ impl std::error::Error for LedgerError {}
 
 /// Trait defining append operations for audit ledgers.
 pub trait AuditLedgerWriter: Send + Sync {
-    /// Cryptographically append a new action record to the ledger.
+    /// Cryptographically append a new action record to the ledger. Implementations are
+    /// internally synchronized, so one ledger can be shared across threads (e.g. in an `Arc`).
     fn append(
-        &mut self,
+        &self,
         event_type: &str,
         actor: &str,
         payload: &str,
@@ -470,7 +471,7 @@ impl InMemoryLedger {
 
 impl AuditLedgerWriter for InMemoryLedger {
     fn append(
-        &mut self,
+        &self,
         event_type: &str,
         actor: &str,
         payload: &str,
@@ -702,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_append_and_verify_chain() {
-        let mut ledger = InMemoryLedger::new();
+        let ledger = InMemoryLedger::new();
         let ev1 = ledger
             .append("agent.init", "hermes", "{\"state\":\"ready\"}")
             .unwrap();
