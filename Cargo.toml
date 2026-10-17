@@ -12,3 +12,4 @@ categories = ["development-tools"]
 
 [dependencies]
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc"] }
+serde_json = "1"

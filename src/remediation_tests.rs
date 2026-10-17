@@ -199,3 +199,35 @@ fn f4_weak_keys_noncanonical_hex_and_untagged_signatures_are_rejected() {
         "no domain tag"
     );
 }
+
+#[test]
+fn f5_only_canonical_payloads_are_recorded() {
+    let mut ledger = InMemoryLedger::new();
+    for rejected in [
+        "{\"b\":2,\"a\":1}",
+        "{\"a\": 1, \"b\": 2}",
+        "{\"a\":1,\"b\":2,\"a\":1}",
+        "{\"\\u0061\":1,\"b\":2}",
+        "{\"a\":1.0,\"b\":2}",
+        "{\"a\":9007199254740992}",
+        "{\"a\":-0}",
+        "{\"a\":{\"d\":1,\"c\":2}}",
+        "[1,2]",
+        "definitely not json",
+    ] {
+        let result = ledger.append("tool.exec", "worker_1", rejected);
+        assert!(
+            matches!(result, Err(LedgerError::InvalidInput(_))),
+            "{rejected}"
+        );
+    }
+    assert!(ledger.all_events().unwrap().is_empty());
+    for accepted in [
+        "{\"a\":1,\"b\":2}",
+        "{}",
+        "{\"a\":0,\"b\":{\"c\":[0,{\"d\":1,\"e\":2}]}}",
+        "{\"k\":\"caf\u{e9} \\\"q\\\"\",\"n\":-9007199254740991}",
+    ] {
+        ledger.append("tool.exec", "worker_1", accepted).unwrap();
+    }
+}

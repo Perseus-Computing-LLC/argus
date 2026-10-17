@@ -73,7 +73,7 @@ pub struct AuditEvent {
     pub event_type: String,
     /// Process, user, or subagent identity that triggered the action.
     pub actor: String,
-    /// Canonical JSON payload representing the event inputs and parameters.
+    /// Canonical JSON object (see [`validate_canonical_payload`]): event inputs and parameters.
     pub payload: String,
     /// The event_hash of sequence - 1, or GENESIS_PREV_HASH for sequence 1.
     pub prev_hash: String,
@@ -136,6 +136,7 @@ impl AuditEvent {
 
 /// Errors returned during ledger append, retrieval, or verification operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LedgerError {
     /// Event sequence numbers are missing or out of order.
     SequenceDiscontinuity(String),
@@ -143,6 +144,8 @@ pub enum LedgerError {
     HashMismatch(String),
     /// Mutex lock contention or thread synchronization failure.
     LockError(String),
+    /// `append` input rejected before anything was recorded.
+    InvalidInput(String),
 }
 
 impl std::fmt::Display for LedgerError {
@@ -151,6 +154,7 @@ impl std::fmt::Display for LedgerError {
             Self::SequenceDiscontinuity(msg) => write!(f, "Sequence discontinuity: {}", msg),
             Self::HashMismatch(msg) => write!(f, "Hash mismatch: {}", msg),
             Self::LockError(msg) => write!(f, "Lock error: {}", msg),
+            Self::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
         }
     }
 }
@@ -387,6 +391,43 @@ pub fn compute_event_hash(
     sha256_hex(&preimage)
 }
 
+/// Largest integer magnitude exactly representable as an IEEE-754 double (RFC 7493 I-JSON).
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+/// Accept only a payload already in canonical form: a JSON object, compact, keys sorted by code
+/// point, no duplicate keys or redundant escapes, and integers within +/-(2^53 - 1) as the only
+/// numbers. Those bytes equal `argus_ledger.canonical` output (`sort_keys`, compact separators,
+/// `ensure_ascii=False`) and RFC 8785 output, except for object keys that mix U+E000..=U+FFFF
+/// with non-BMP characters (code-point versus UTF-16 key order).
+pub fn validate_canonical_payload(payload: &str) -> Result<(), LedgerError> {
+    // Key order and integer spelling are checked here, not inherited from `serde_json::Map` and
+    // `Number`: any crate in the build can enable serde_json's `preserve_order` (maps keep
+    // insertion order) or `arbitrary_precision` (numbers keep their source text, e.g. `-0`).
+    fn canonical(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Number(n) => n.as_i64().is_some_and(|v| {
+                v.unsigned_abs() <= MAX_SAFE_INTEGER && *n == serde_json::Number::from(v)
+            }),
+            serde_json::Value::Array(items) => items.iter().all(canonical),
+            serde_json::Value::Object(map) => {
+                map.keys().zip(map.keys().skip(1)).all(|(a, b)| a < b)
+                    && map.values().all(canonical)
+            }
+            _ => true,
+        }
+    }
+    let invalid = |reason: &str| LedgerError::InvalidInput(format!("payload {reason}"));
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|_| invalid("is not valid JSON"))?;
+    if !value.is_object() || !canonical(&value) {
+        return Err(invalid("must be a sorted-key object with safe integers"));
+    }
+    if serde_json::to_string(&value).ok().as_deref() != Some(payload) {
+        return Err(invalid("is not in canonical form"));
+    }
+    Ok(())
+}
+
 /// Thread-safe in-memory reference implementation of an append-only audit ledger.
 #[derive(Default, Clone)]
 pub struct InMemoryLedger {
@@ -416,6 +457,7 @@ impl AuditLedgerWriter for InMemoryLedger {
         actor: &str,
         payload: &str,
     ) -> Result<AuditEvent, LedgerError> {
+        validate_canonical_payload(payload)?;
         let mut store = self
             .events
             .lock()
