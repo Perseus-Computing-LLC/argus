@@ -52,7 +52,7 @@
 //! ```
 
 use std::borrow::Borrow;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -157,7 +157,7 @@ pub enum LedgerError {
     SequenceDiscontinuity(String),
     /// Computed event hash does not match recorded event hash.
     HashMismatch(String),
-    /// Mutex lock contention or thread synchronization failure.
+    /// Lock failure in other backends; `InMemoryLedger` recovers poisoned locks instead.
     LockError(String),
     /// `append` input rejected before anything was recorded.
     InvalidInput(String),
@@ -530,12 +530,18 @@ impl InMemoryLedger {
         }
     }
 
+    /// Lock the store, recovering from poisoning. Sound because the only mutation is one
+    /// `Vec::push` of a fully built event, so a panic cannot leave a partial write behind.
+    fn store(&self) -> MutexGuard<'_, Vec<Arc<AuditEvent>>> {
+        self.events.lock().unwrap_or_else(|poisoned| {
+            self.events.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
     /// O(n) pointer copy under the lock; all O(bytes) work happens after it is released.
     fn snapshot(&self) -> Result<Vec<Arc<AuditEvent>>, LedgerError> {
-        let store = self
-            .events
-            .lock()
-            .map_err(|e| LedgerError::LockError(e.to_string()))?;
+        let store = self.store();
         Ok(store.clone())
     }
 }
@@ -561,10 +567,7 @@ impl AuditLedgerWriter for InMemoryLedger {
         // All O(payload) work (hashing, copying) happens before the lock is taken.
         let digest = compute_payload_digest(payload);
         let payload = payload.to_owned();
-        let mut store = self
-            .events
-            .lock()
-            .map_err(|e| LedgerError::LockError(e.to_string()))?;
+        let mut store = self.store();
         let sequence = (store.len() as u64) + 1;
         let prev_hash = if let Some(last) = store.last() {
             last.event_hash.clone()
@@ -607,10 +610,7 @@ impl AuditLedgerWriter for InMemoryLedger {
 
 impl AuditLedgerReader for InMemoryLedger {
     fn get_event(&self, sequence: u64) -> Result<Option<AuditEvent>, LedgerError> {
-        let store = self
-            .events
-            .lock()
-            .map_err(|e| LedgerError::LockError(e.to_string()))?;
+        let store = self.store();
         let event = if sequence == 0 || sequence > (store.len() as u64) {
             None
         } else {
@@ -621,10 +621,7 @@ impl AuditLedgerReader for InMemoryLedger {
     }
 
     fn head(&self) -> Result<Option<AuditEvent>, LedgerError> {
-        let store = self
-            .events
-            .lock()
-            .map_err(|e| LedgerError::LockError(e.to_string()))?;
+        let store = self.store();
         let head = store.last().cloned();
         drop(store);
         Ok(head.map(Arc::unwrap_or_clone))

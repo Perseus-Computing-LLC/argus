@@ -346,3 +346,19 @@ fn f9_appends_proceed_while_a_large_chain_is_verified() {
         "append waited {worst:?} during a {verify_time:?} verify"
     );
 }
+
+#[test]
+fn f10_poisoned_lock_is_recovered_without_data_loss() {
+    let mut ledger = ledger_with(1);
+    let shared = ledger.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = shared.events.lock().unwrap();
+        panic!("simulated panic inside the critical section");
+    })
+    .join();
+    assert!(ledger.events.is_poisoned());
+    ledger.append("tool.exec", "worker_1", "{}").unwrap();
+    assert!(!ledger.events.is_poisoned());
+    assert_eq!(ledger.all_events().unwrap().len(), 2);
+    assert!(ledger.verify_chain().unwrap().valid);
+}
