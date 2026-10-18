@@ -149,15 +149,25 @@ class TestHashFormat(unittest.TestCase):
         self.assertTrue(report.valid, report.error_detail)
         self.assertEqual((report.total_events, report.legacy_events), (4, 3))
 
-    def test_format_downgrade_after_a_format_2_record_is_rejected(self):
+    def test_records_from_a_writer_on_the_previous_release_keep_verifying(self):
+        """During a rolling upgrade a process still on the previous release appends format-1 records
+        after format-2 ones; the chain stays valid and tampering with those records is still detected."""
         ledger = AppendOnlyLedger(self.path)
         first = ledger.append("tool.exec", "agent", {"i": 1})
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(_legacy_record(2, first.event_hash, {"i": 2})) + "\n")
+        third = ledger.append("tool.exec", "agent", {"i": 3})
+        self.assertEqual((third.sequence, third.hash_version), (3, CURRENT_HASH_VERSION))
+        report = ledger.verify_chain()
+        self.assertTrue(report.valid, report.error_detail)
+        self.assertEqual((report.total_events, report.legacy_events), (3, 1))
+
+        records = _records(self.path)
+        records[1]["payload"] = {"i": "forged"}
+        _write(self.path, records)
         report = ledger.verify_chain()
         self.assertFalse(report.valid)
         self.assertEqual(report.first_broken_sequence, 2)
-        self.assertIn("downgrade", report.error_detail)
 
     def test_unknown_hash_format_fails_closed(self):
         AppendOnlyLedger(self.path).append("tool.exec", "agent", {"i": 1})
