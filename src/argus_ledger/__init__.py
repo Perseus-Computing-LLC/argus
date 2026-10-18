@@ -22,15 +22,29 @@ from .protocols import (
     TamperDetectedError,
 )
 from .ledger import AppendOnlyLedger
-from .proofweave import PolicyActionBinding
+from .proofweave import (
+    AgentTraceBinding,
+    MerkleMountainRange,
+    PolicyActionBinding,
+    PraxaGovernanceGovernor,
+    PraxaState,
+    ProofWeaveTransaction,
+    RAGTriadBinding,
+)
 
-__version__ = "0.1.0a3"
+__version__ = "0.1.0a4"
 
 __all__ = [
     "AuditEvent",
     "ChainVerificationReport",
     "GENESIS_PREV_HASH",
     "PolicyActionBinding",
+    "AgentTraceBinding",
+    "RAGTriadBinding",
+    "ProofWeaveTransaction",
+    "PraxaGovernanceGovernor",
+    "PraxaState",
+    "MerkleMountainRange",
     "canonical_json_bytes",
     "canonical_json_dumps",
     "compute_event_hash",
