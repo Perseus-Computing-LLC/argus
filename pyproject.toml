@@ -25,7 +25,8 @@ requires-python = ">=3.11"
 dependencies = ["pydantic>=2"]
 
 [project.urls]
-Homepage = "https://github.com/Perseus-Computing-LLC/argus"
+Homepage = "https://telarch.ai/argus"
+Documentation = "https://docs.rs/argus-ledger"
 Repository = "https://github.com/Perseus-Computing-LLC/argus"
 
 [tool.pytest.ini_options]

@@ -52,6 +52,11 @@ class AuditLedgerReader(Protocol):
         """Return the latest event in the chain."""
         ...
 
+    @property
+    def head_hash(self) -> Optional[str]:
+        """Event hash of the latest event in the chain."""
+        ...
+
 
 @runtime_checkable
 class AuditVerifier(Protocol):

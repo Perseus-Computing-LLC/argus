@@ -180,6 +180,26 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+    @property
+    def head_hash(self) -> Optional[str]:
+        """Event hash of the latest ledger record, or None if the ledger is empty."""
+        latest = self.head()
+        return latest.event_hash if latest else None
+
+    @property
+    def last_hash(self) -> Optional[str]:
+        """Alias for head_hash."""
+        return self.head_hash
+
+    @property
+    def current_sequence(self) -> int:
+        """Sequence index of the latest ledger record, or 0 if empty."""
+        latest = self.head()
+        return latest.sequence if latest else 0
+
+    def __len__(self) -> int:
+        return self.current_sequence
+
     def get_event(self, sequence: int) -> Optional[AuditEvent]:
         for event in self.iter_events():
             if event.sequence == sequence:
