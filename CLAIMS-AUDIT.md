@@ -17,12 +17,15 @@ The following claims previously present in documentation or legacy monolithic ma
 | **Argus Latency** | 4.12 µs append latency | **CORRECTED** | Measured bare-metal throughput is ~600,000 events/s (~1.67 µs/op) for in-memory SHA-256 event chaining. |
 | **Argus Verification**| 2,170,000 events/s verification | **CORRECTED** | 2.17M was a copy-paste artifact from Kibisis in-memory ingestion. Measured full-chain validation traversal is ~839,000 events/s (~1.19 µs/event). |
 | **Argus Tamper** | Scans 100,000 events in 46.00 µs | **CORRECTED** | The 46.50 µs metric represents immediate fail-closed abort upon detecting tampered block #42 in sequence, not a full 100,000-block traversal. |
+| **Argus Integrity** | Altered or deleted entries always fail verification | **CORRECTED** | Without an external anchor, verification proves internal consistency only: removing the newest events, an emptied ledger, and a recomputed chain all pass. Anchored verification (`verify_chain_with` + `ChainAnchor` in Rust, `verify_chain(anchor=...)` in Python) or signature checks close these cases. "Mathematical immutability guarantee" replaced by the measured property (single-bit changes to hashed fields are detected). |
+| **Argus Hash Format** | SHA-256 binds every event field | **REMEDIATED** | The `:`-joined preimage let text move between adjacent fields (for example `event_type` into `actor`) without changing the hash. Hash format 2 length-prefixes every field under a domain tag, identical in Rust and Python and pinned by shared golden vectors; Python verifies format-1 records from earlier versions and never writes them. |
+| **Argus Signatures** | Signed events cannot be forged without the key | **REMEDIATED** | Rust never signed appended events or checked signatures during verification, and both implementations accepted small-order Ed25519 public keys (an identity key verifies a forged `R = identity, S = 0` signature for every message) and non-canonical signature hex. Rust now signs on append and uses `verify_strict`; Python rejects small-order keys and `R` points and non-canonical hex; both domain-separate signatures. |
 
 ---
 
 ## 2. Active Verified Claims Matrix
 
-All metrics below are reproducible via `cargo run --release -p telarch-benchmarks` on bare-metal Linux x86_64:
+All metrics below are reproducible via `cargo run --release -p telarch-benchmarks` on bare-metal Linux x86_64. The Argus rows were measured on the 0.1.0-alpha.3 crate the benchmark suite vendors (before payload validation and hash format 2) and need re-measurement once the suite vendors the hardened crate:
 
 | System | Metric | Target / Claim | Verification Command | Status |
 | :--- | :--- | :--- | :--- | :--- |

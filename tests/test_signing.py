@@ -13,7 +13,8 @@ KEY = b"k" * 32
 
 def _rewrite_chain_without_key(path, edit_seq, new_payload):
     """The attack the unkeyed chain cannot detect: change one event and recompute every later hash."""
-    events = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    with open(path, encoding="utf-8") as fh:
+        events = [json.loads(l) for l in fh if l.strip()]
     prev = "0" * 64
     for ev in events:
         if ev["sequence"] == edit_seq:
