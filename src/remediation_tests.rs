@@ -545,3 +545,27 @@ fn opt_streaming_canonical_check_matches_reserialization() {
         );
     }
 }
+
+#[test]
+fn f4_signatures_match_an_independent_openssl_implementation() {
+    // Ed25519 is deterministic: the Python package (OpenSSL via `cryptography`) produces the same
+    // signature over the domain-tagged golden event hash for seed 07 * 32.
+    let seed = [7u8; 32];
+    let event_hash = "3a7cfe22bc8ca5b032bca7defaaa1ac22f05c9922dff2bd5032e820f1a927f9b";
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+    assert_eq!(
+        hex_lower(public.as_bytes()),
+        "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+    );
+    let signature = sign_event_hash_ed25519(event_hash, &seed);
+    assert_eq!(
+        signature,
+        "ed25519:73124ea3a9e12a395d4670806d1f1ca21debfa1d1d53949dac5718844ca64748\
+         7b2d6eaf76e8593785308bb522b4a73ced14a206fd2d3327a1b7625a2ba36706"
+    );
+    assert!(verify_event_hash_ed25519(
+        event_hash,
+        &signature,
+        public.as_bytes()
+    ));
+}
