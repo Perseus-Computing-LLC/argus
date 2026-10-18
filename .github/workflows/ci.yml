@@ -40,3 +40,14 @@ jobs:
         run: cargo check --verbose
       - name: Cargo test
         run: cargo test --verbose
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.85 (the declared rust-version)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - name: Cargo test with the locked dependencies
+        run: cargo test --locked --verbose

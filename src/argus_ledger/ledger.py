@@ -270,7 +270,6 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             )
 
         expected_prev = GENESIS_PREV_HASH
-        newest_version = 1
         for idx, event in enumerate(events, start=1):
             if event.sequence != idx:
                 return broken(idx, f"Sequence discontinuity: expected {idx}, found {event.sequence}")
@@ -280,18 +279,14 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     idx, f"Broken prev_hash at sequence {idx}: expected {expected_prev}, got {event.prev_hash}"
                 )
 
-            if event.hash_version < newest_version:
-                return broken(
-                    idx, f"Hash format downgrade at sequence {idx}: format {event.hash_version} after {newest_version}"
-                )
-
+            # Format-1 records may follow format-2 ones while a process still runs the previous release.
+            # Relabelling a record's format cannot make it verify: its stored hash commits to one format.
             if not verify_event(event):
                 return broken(idx, f"Tampered payload or signature at sequence {idx}")
 
             if self._key is not None and not self._signature_valid(event, self._key):
                 return broken(idx, f"Missing or invalid signature at sequence {idx}")
 
-            newest_version = event.hash_version
             legacy_events += event.hash_version == 1
             expected_prev = event.event_hash
 
