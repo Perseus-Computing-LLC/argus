@@ -22,9 +22,9 @@ Argus records every event into an append-only sequence where each entry includes
 ## Key design goals
 
 - **Continuous hash chaining:** Every event links cryptographically to the one before it, rooted at genesis.
-- **Fail-closed tamper detection:** Verifies cryptographic continuity and aborts immediately when any hash or payload is corrupted. Tampered event #42 is detected in ~46.5 &micro;s.
-- **Low latency appends:** In-memory sequential appends with SHA-256 chaining execute at ~600,000 events/s (~1.67 &micro;s/event).
-- **High throughput chain verification:** Traverses and validates complete cryptographic sequences at ~839,000 events/s (~1.19 &micro;s/event).
+- **Fail-closed tamper detection:** Verifies cryptographic continuity and aborts immediately when any hash or payload is corrupted. Tampered event #42 is detected in ~46.3 &micro;s.
+- **Low latency appends:** In-memory sequential appends, including payload validation and SHA-256 chaining, run at ~810,000 events/s (~1.24 &micro;s/event).
+- **High throughput chain verification:** Traverses and validates complete cryptographic sequences at ~2,433,000 events/s (~0.41 &micro;s/event).
 - **Self-contained:** Runs fully offline as an in-memory library without external audit services or cloud dependencies.
 
 ---
@@ -116,14 +116,14 @@ The ledger file is created owner-only (0600). Keep the key somewhere an attacker
 
 ## Benchmark results
 
-Measured on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fat"`) with the `telarch-benchmarks` suite, which vendors the 0.1.0-alpha.3 crate (before payload validation and hash format 2):
+Measured with the [`telarch-benchmarks`](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) suite, which vendors this crate as merged, on bare-metal Linux x86_64 (Intel Core i5-13500, runs pinned to the performance cores, `rustc 1.97.1`, default release profile). The figures come from that repository's committed reports:
 
 | Metric | Measurement | Test condition | Operational Guarantee |
 | :--- | :--- | :--- | :--- |
-| **Append Throughput (1M Events)** | **632,170 events/s** | 1,000,000 sequential events (`argus_1m_scale`) | 1.58 &micro;s / event continuous SHA-256 chaining |
-| **Linear Verification (1M Events)** | **770,758 events/s** | Full 1M event SHA-256 hash chain validation | 1.30 &micro;s / event; validates 1M events in 1.29 s |
-| **Tamper Detection (Sequence #500,000)** | **640.48 ms** | Mid-chain single-bit payload corruption | Fail-closed immediate abort and offset isolation |
-| **Micro-Audit Latency (Block #42)** | **46.50 &micro;s** | Short sequence microbenchmark | Sub-50 µs early tamper detection |
+| **Append Throughput (1M Events)** | **809,698 events/s** | 1,000,000 sequential `append` calls (`argus_1m_scale`) | 1.24 &micro;s / event including payload validation and SHA-256 chaining |
+| **Linear Verification (1M Events)** | **2,433,053 events/s** | Full 1M event SHA-256 hash chain validation | 0.41 &micro;s / event; validates 1M events in 0.41 s |
+| **Tamper Detection (Sequence #500,000)** | **185.35 ms** | Mid-chain payload corruption | Fail-closed immediate abort and offset isolation |
+| **Micro-Audit Latency (Block #42)** | **46.29 &micro;s** | Short sequence microbenchmark | Sub-50 µs early tamper detection |
 | **Tamper Detection Sensitivity** | **100.00%** | Single-bit byte flip sensitivity | Any single-bit change to a hashed field is detected |
 | **External Dependencies** | **0** | Standalone offline primitives | Zero network, zero remote cloud requirement |
 
