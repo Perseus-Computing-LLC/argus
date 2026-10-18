@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Iterator, Optional, Protocol, runtime_checkable
-from .models import AuditEvent, ChainVerificationReport
+from .models import AuditEvent, ChainAnchor, ChainVerificationReport
 
 
 class LedgerError(Exception):
@@ -57,6 +57,7 @@ class AuditLedgerReader(Protocol):
 class AuditVerifier(Protocol):
     """Verifier interface for validating hash chain continuity."""
 
-    def verify_chain(self) -> ChainVerificationReport:
-        """Traverse the entire ledger and verify SHA-256 hash continuity and integrity."""
+    def verify_chain(self, anchor: Optional[ChainAnchor] = None) -> ChainVerificationReport:
+        """Traverse the entire ledger and verify SHA-256 hash continuity and integrity. Without an
+        anchor (an externally kept ``AuditEvent.anchor()``) this proves internal consistency only."""
         ...

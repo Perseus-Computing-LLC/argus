@@ -1,9 +1,12 @@
 """argus-ledger: Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents."""
 
-from .models import AuditEvent, ChainVerificationReport, GENESIS_PREV_HASH
+from .models import AuditEvent, ChainAnchor, ChainVerificationReport, CURRENT_HASH_VERSION, GENESIS_PREV_HASH
 from .canonical import canonical_json_bytes, canonical_json_dumps
 from .hasher import (
+    SIGNATURE_DOMAIN,
     compute_event_hash,
+    compute_payload_digest,
+    ed25519_public_key,
     sign_event_hash,
     sign_event_hash_ed25519,
     verify_event,
@@ -43,4 +46,9 @@ __all__ = [
     "LedgerError",
     "TamperDetectedError",
     "AppendOnlyLedger",
+    "ChainAnchor",
+    "CURRENT_HASH_VERSION",
+    "SIGNATURE_DOMAIN",
+    "compute_payload_digest",
+    "ed25519_public_key",
 ]
