@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Hash format 2: SHA-256 over length-prefixed binary field serialization (`argus.event.v2\0`) preventing adjacent field ambiguity.
 - Head anchoring via `ChainAnchor` and `VerificationPolicy` to detect rollback, truncation, and full-chain rewrites.
-- Ed25519 digital signatures on individual events and C2SP signed checkpoint notes.
+- Ed25519 signatures on individual events. Correction: this entry also listed C2SP signed
+  checkpoint notes, which this repository does not implement.
 - Adopted RustCrypto `sha2` and `ed25519-dalek` crates.
 - MSRV enforcement for `rust-version = "1.85"` in `Cargo.toml`.
 
