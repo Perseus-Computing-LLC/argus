@@ -21,17 +21,19 @@ When agents run commands, call APIs or edit files, Argus keeps an ordered record
 
 ## Installation
 
+crates.io and PyPI have 0.1.0-alpha.2 (0.1.0a2 on PyPI). This README describes 0.1.0-alpha.4, which is not published yet. Until it is, install from this repository.
+
 ### Rust
 
 ```toml
 [dependencies]
-argus-ledger = "0.1.0-alpha.4"
+argus-ledger = { git = "https://github.com/Perseus-Computing-LLC/argus", branch = "main" }
 ```
 
 ### Python
 
 ```bash
-pip install argus-ledger
+pip install "argus-ledger @ git+https://github.com/Perseus-Computing-LLC/argus@main"
 ```
 
 ## Quickstart
