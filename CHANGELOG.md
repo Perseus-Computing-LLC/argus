@@ -5,7 +5,7 @@ All notable changes to `argus` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0-alpha.4] - Unreleased
+## [0.1.0-alpha.4] - 2026-10-19
 
 ### Fixed
 - `cryptography` is a declared dependency. Ed25519 signing and verification import it, but
@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   telarch-benchmarks) and the signed checkpoint note, which this repository does not implement;
   anchors are a sequence number and hash passed to `verify_chain`. The README now says the Python
   package needs `fcntl`, so it does not run on Windows.
+- SECURITY.md and the README no longer call the log immutable or describe signed checkpoints.
 
 ### Added
 - Release workflow: builds and attests the sdist, wheel and crate, installs the wheel with its

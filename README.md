@@ -22,17 +22,17 @@ Agents run commands, call APIs and edit files. Afterwards the log is the only ac
 
 ## Install
 
-crates.io and PyPI have 0.1.0-alpha.2 (0.1.0a2 on PyPI). This README describes 0.1.0-alpha.4, which is not published yet. Until it is, install from this repository.
+This README describes 0.1.0-alpha.4 (0.1.0a4 on PyPI). It is a pre-release, so name the version.
 
 ```toml
 # Rust: Cargo.toml
 [dependencies]
-argus-ledger = { git = "https://github.com/Perseus-Computing-LLC/argus", branch = "main" }
+argus-ledger = "0.1.0-alpha.4"
 ```
 
 ```bash
 # Python
-pip install "argus-ledger @ git+https://github.com/Perseus-Computing-LLC/argus@main"
+pip install argus-ledger==0.1.0a4
 ```
 
 ## Quickstart
