@@ -91,7 +91,7 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 - **Alpha release:** APIs and formats are subject to revision before 1.0.
 - **Detection, not prevention:** Argus cannot stop someone with write access from editing storage. It makes the edit visible.
 - **Linear chain:** Verification reads every event, so it takes time proportional to the ledger's length, and there are no inclusion proofs for single events.
-- **Anchoring requirement:** An unanchored chain that is rewritten and re-hashed from genesis is internally consistent. Keep head hashes outside the ledger, or in signed checkpoints, to detect a complete rewrite.
+- **Anchoring requirement:** An unanchored chain that is rewritten and re-hashed from genesis is internally consistent. Keep the latest sequence number and hash somewhere the writer cannot change, and verify against it, to detect a complete rewrite.
 - **Storage scope:** The Rust crate provides `InMemoryLedger`. The Python package writes a local JSONL file locked with `fcntl`, so it runs on Linux and macOS, not Windows.
 - **Not independently assessed:** No security review or certification has been completed. Designed for local and disconnected use.
 

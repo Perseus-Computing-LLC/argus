@@ -1,17 +1,20 @@
 //! # argus-ledger
 //!
-//! Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents.
+//! Tamper-evident, append-only SHA-256 audit log for AI agents.
 //!
-//! When autonomous agents execute commands, invoke external APIs, or mutate persistent
-//! memory, post-incident investigations require cryptographic certainty regarding what
-//! actions occurred and in what sequence. Standard application logs can be rewritten,
-//! reordered, or truncated.
+//! When an agent runs commands, calls APIs or changes its memory, a review afterward needs
+//! to know what happened and in what order. Ordinary application logs can be edited,
+//! reordered or truncated without a trace.
 //!
-//! Argus provides an immutable append-only hash chain where each event records:
+//! Argus keeps an append-only hash chain in which each event records:
 //!
-//! 1. A strictly sequential sequence integer.
-//! 2. A cryptographic digest binding the payload to the previous event's hash (`prev_hash`).
-//! 3. Deterministic chain verification that validates integrity in linear time.
+//! 1. Its position in the chain (a sequence number).
+//! 2. A SHA-256 digest that binds its payload to the previous event's hash (`prev_hash`).
+//!
+//! Verification walks the chain once and reports the first broken position. Without an
+//! anchor it proves internal consistency only: a truncated chain, or one recomputed by
+//! someone who can write the log, still passes. Keep a `ChainAnchor` where the writer
+//! cannot change it to detect rollback, truncation below the anchor and rewritten history.
 //!
 //! ## Architecture Overview
 //!
@@ -62,7 +65,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GENESIS_PREV_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// An immutable event record committed to the audit chain.
+/// One event record in the audit chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
     /// Monotonically increasing sequence number starting at 1.
