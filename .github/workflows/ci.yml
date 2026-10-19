@@ -48,10 +48,12 @@ jobs:
         run: cargo test --locked --verbose
 
   test-python:
-    name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    name: Python ${{ matrix.python-version }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-15]
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
@@ -66,7 +68,17 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pydantic cryptography pytest hatchling
+          pip install pydantic cryptography pytest hatchling build
+
+      # Installs the built wheel the way a user would: dependencies resolved from PyPI, no --no-deps.
+      - name: Install the wheel with its dependencies in a clean venv
+        shell: bash
+        run: |
+          python -m build --wheel
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/smoke/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/smoke/bin/python" -c "import platform, argus_ledger; print(platform.system(), platform.machine(), 'argus_ledger', argus_ledger.__version__)"
 
       - name: Run pytest
         run: |
