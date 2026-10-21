@@ -6,7 +6,7 @@ import stat
 import tempfile
 import unittest
 
-from argus_ledger import AppendOnlyLedger, compute_event_hash, sign_event_hash
+from argus_ledger import AppendOnlyLedger, compute_event_hash, sign_event_hash, sign_event_hash_ed25519, verify_signature
 
 KEY = b"k" * 32
 
@@ -110,8 +110,8 @@ class TestSigning(unittest.TestCase):
         self.assertTrue(writer_report.valid)
         self.assertEqual(writer_report.total_events, 1)
 
-        # Verify with public key
-        reader_ledger = AppendOnlyLedger(self.path, signing_key=pub_bytes)
+        # Verify with the public key alone
+        reader_ledger = AppendOnlyLedger(self.path, verify_key=pub_bytes)
         report = reader_ledger.verify_chain()
         self.assertTrue(report.valid)
         self.assertEqual(report.total_events, 1)
@@ -121,6 +121,78 @@ class TestSigning(unittest.TestCase):
         forged_report = reader_ledger.verify_chain()
         self.assertFalse(forged_report.valid)
         self.assertEqual(forged_report.first_broken_sequence, 1)
+
+    def _ed25519_chain(self, n=3):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        priv = ed25519.Ed25519PrivateKey.generate()
+        seed = priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+        public = priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        self._fill(AppendOnlyLedger(self.path, signing_key=seed, use_ed25519=True), n)
+        return public
+
+    def _rewrite_and_sign(self, sign):
+        """An attacker who can write the file changes event 2, then recomputes and re-signs every event."""
+        with open(self.path, encoding="utf-8") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        prev = "0" * 64
+        for ev in events:
+            if ev["sequence"] == 2:
+                ev["payload"] = {"i": "forged"}
+            ev["prev_hash"] = prev
+            ev["event_hash"] = compute_event_hash(ev["sequence"], ev["event_id"], ev["timestamp"], ev["event_type"],
+                                                  ev["actor"], prev, ev["payload"], hash_version=ev["hash_version"])
+            ev["signature"] = sign(ev["event_hash"])
+            prev = ev["event_hash"]
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(ev) + "\n" for ev in events)
+
+    def test_the_public_key_alone_cannot_forge_an_ed25519_ledger(self):
+        public = self._ed25519_chain()
+        reader = AppendOnlyLedger(self.path, verify_key=public)
+        self.assertTrue(reader.verify_chain().valid)
+        forgeries = {
+            "HMAC keyed with the public key": lambda event_hash: sign_event_hash(event_hash, public),
+            "Ed25519 with the public key's bytes as the seed": lambda event_hash: sign_event_hash_ed25519(event_hash, public),
+        }
+        for name, sign in forgeries.items():
+            with self.subTest(name):
+                self._rewrite_and_sign(sign)
+                report = reader.verify_chain()
+                self.assertFalse(report.valid)
+                self.assertEqual(report.first_broken_sequence, 1)
+
+    def test_a_verify_key_ledger_cannot_append(self):
+        public = self._ed25519_chain(1)
+        with self.assertRaises(PermissionError):
+            AppendOnlyLedger(self.path, verify_key=public).append("t", "a", {})
+
+    def test_a_public_key_passed_as_signing_key_fails_with_a_hint(self):
+        public = self._ed25519_chain(2)
+        report = AppendOnlyLedger(self.path, signing_key=public).verify_chain()
+        self.assertFalse(report.valid)
+        self.assertEqual(report.first_broken_sequence, 1)
+        self.assertIn("verify_key", report.error_detail or "")
+
+    def test_signing_key_and_verify_key_are_checked(self):
+        with self.assertRaises(ValueError):
+            AppendOnlyLedger(self.path, signing_key=KEY, verify_key=b"p" * 32)
+        with self.assertRaises(ValueError):
+            AppendOnlyLedger(self.path, verify_key=b"short")
+        AppendOnlyLedger(self.path, verify_key=b"p" * 32, require_signature=True)  # a verify_key satisfies it
+
+    def test_verify_signature_uses_the_callers_scheme(self):
+        public = self._ed25519_chain(1)
+        event = AppendOnlyLedger(self.path, verify_key=public).head()
+        assert event is not None
+        self.assertTrue(verify_signature(event, public, scheme="ed25519"))
+        self.assertFalse(verify_signature(event, public))  # the default scheme is HMAC
+        hmac_event = event.model_copy(update={"signature": sign_event_hash(event.event_hash, KEY)})
+        self.assertTrue(verify_signature(hmac_event, KEY))
+        self.assertFalse(verify_signature(hmac_event, KEY, scheme="ed25519"))
+        with self.assertRaises(ValueError):
+            verify_signature(event, public, scheme="rsa")
 
 
 if __name__ == "__main__":

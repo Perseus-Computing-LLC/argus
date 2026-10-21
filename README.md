@@ -84,7 +84,7 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 
 - **Linear SHA-256 hash chain.** Each event's hash covers its sequence number, event ID, timestamp, event type, actor, the previous event's hash and a digest of its canonical JSON payload (`compute_event_hash` in `src/argus_ledger/hasher.py`; `src/lib.rs`).
 - **Tamper detection.** `verify_chain` walks the chain from genesis and reports the first sequence whose hash or link does not check out (`first_broken_sequence`, `src/argus_ledger/ledger.py`).
-- **Anchors and signatures.** Verifying against an anchor, a sequence number and hash kept outside the ledger, catches a ledger that was rewritten and re-hashed from genesis. With a signing key, each event also carries an HMAC-SHA256 or Ed25519 signature that verification checks (`src/argus_ledger/hasher.py`, `src/argus_ledger/ledger.py`; Rust: `VerificationPolicy` in `src/lib.rs`).
+- **Anchors and signatures.** Verifying against an anchor, a sequence number and hash kept outside the ledger, catches a ledger that was rewritten and re-hashed from genesis. With a signing key, each event also carries an HMAC-SHA256 or Ed25519 signature that verification checks (`src/argus_ledger/hasher.py`, `src/argus_ledger/ledger.py`; Rust: `VerificationPolicy` in `src/lib.rs`). To check an Ed25519-signed ledger without its private key, open it with `AppendOnlyLedger(path, verify_key=public_key)`: it checks Ed25519 signatures only and cannot append. Never pass a public key as `signing_key`, which is an HMAC secret: anyone who knows the public key could then sign events.
 
 ## Limits
 
