@@ -5,6 +5,27 @@ All notable changes to `argus` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- Python: a ledger verified with only an Ed25519 public key accepted events forged by anyone who
+  knew that public key. `verify_signature` let the signature choose its scheme, so it accepted an
+  HMAC-SHA256 "signature" keyed with the public key, and for `ed25519:` signatures it also retried
+  the key as a private seed, so an Ed25519 signature made with the public key's bytes as the seed
+  verified too. Both forgeries rewrote a whole chain that `verify_chain` then reported as valid.
+  The verifier now chooses the scheme. The Rust crate was not affected: its `VerificationPolicy`
+  takes a typed Ed25519 public key.
+
+### Changed
+- Python: `AppendOnlyLedger(path, verify_key=public_key)` checks an Ed25519-signed ledger with its
+  32-byte public key. It accepts Ed25519 signatures only and cannot append (`PermissionError`).
+- Python: passing an Ed25519 public key as `signing_key`, the way 0.1.0-alpha.4 documented checking
+  an Ed25519 ledger, no longer verifies one. `signing_key` is an HMAC secret: the ledger now
+  rejects `ed25519:` signatures, with an error that names `verify_key`. Switch to `verify_key=`.
+- Python: `verify_signature(event, key, *, scheme="hmac")` takes the scheme from the caller,
+  `"hmac"` (the default) or `"ed25519"` with a public key, and no longer derives a public key from
+  the key it is given.
+
 ## [0.1.0-alpha.4] - 2026-10-19
 
 ### Fixed

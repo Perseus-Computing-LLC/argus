@@ -54,24 +54,35 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         *,
         require_signature: bool = False,
         use_ed25519: bool = False,
+        verify_key: Optional[bytes] = None,
     ) -> None:
-        """``signing_key``: when set, every event is signed with HMAC-SHA256 (or Ed25519 if use_ed25519=True),
-        and verification fails for an event whose signature is missing or wrong.
-        Rewriting the whole chain then needs the key, not just the file. A ledger opened with an
-        Ed25519 public key as ``signing_key`` (and use_ed25519=False) verifies Ed25519 signatures.
+        """``signing_key``: when set, every event is signed, with HMAC-SHA256 under this secret or, with
+        ``use_ed25519=True``, with Ed25519 under this 32-byte private seed; verification then fails for an
+        event whose signature is missing, wrong or in the other scheme. Rewriting the whole chain then needs
+        the key, not just the file.
+
+        ``verify_key``: a 32-byte Ed25519 public key, to check an Ed25519-signed ledger without its private
+        key. Such a ledger checks Ed25519 signatures only and cannot append. Never pass a public key as
+        ``signing_key``: that is an HMAC secret, and anyone who knows the public key could sign with it.
+
         ``require_signature=True`` refuses to open without a key. The ledger file is created owner-only (0600)."""
-        if require_signature and not signing_key:
-            raise ValueError("require_signature=True needs a signing_key")
+        if signing_key is not None and verify_key is not None:
+            raise ValueError("pass signing_key (to sign) or verify_key (to check Ed25519 signatures), not both")
+        if require_signature and not (signing_key or verify_key):
+            raise ValueError("require_signature=True needs a signing_key or a verify_key")
         if signing_key is not None and len(signing_key) < 16:
             raise ValueError("signing_key must be at least 16 bytes")
         if use_ed25519:
             if signing_key is None or len(signing_key) != 32:
                 raise ValueError("use_ed25519=True requires a 32-byte Ed25519 seed/private key")
+        if verify_key is not None and len(verify_key) != 32:
+            raise ValueError("verify_key must be a 32-byte Ed25519 public key")
         self._key = signing_key
         self._use_ed25519 = use_ed25519
+        self._signed = signing_key is not None or verify_key is not None
         # Derived once: verification then needs one signature check per event, not a key derivation.
         self._ed25519_public_key = (
-            ed25519_public_key(signing_key) if use_ed25519 and signing_key is not None else None
+            ed25519_public_key(signing_key) if use_ed25519 and signing_key is not None else verify_key
         )
         self.ledger_path = os.path.abspath(ledger_path)
         os.makedirs(os.path.dirname(self.ledger_path), exist_ok=True)
@@ -96,6 +107,8 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         event_id: Optional[str] = None,
     ) -> AuditEvent:
         eid = event_id or str(uuid.uuid4())
+        if self._key is None and self._ed25519_public_key is not None:
+            raise PermissionError("this ledger was opened with verify_key: it can check signatures but not append")
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         with open(self.ledger_path, "a+", encoding="utf-8") as f:
@@ -231,10 +244,17 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
-    def _signature_valid(self, event: AuditEvent, key: bytes) -> bool:
+    def _signature_valid(self, event: AuditEvent) -> bool:
         if self._ed25519_public_key is not None:
             return verify_signature_ed25519(event, self._ed25519_public_key)
-        return verify_signature(event, key)
+        assert self._key is not None
+        return verify_signature(event, self._key, scheme="hmac")
+
+    def _signature_error(self, event: AuditEvent, position: int) -> str:
+        if self._ed25519_public_key is None and (event.signature or "").startswith("ed25519:"):
+            return (f"Ed25519 signature at sequence {position}, but this ledger checks HMAC signatures; "
+                    "open it with verify_key=<Ed25519 public key> to check Ed25519 signatures")
+        return f"Missing or invalid signature at sequence {position}"
 
     def verify_chain(self, anchor: Optional[ChainAnchor] = None) -> ChainVerificationReport:
         """Verify sequence numbers, hash links, event hashes and, with a key, signatures.
@@ -304,8 +324,8 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             if not verify_event(event):
                 return broken(idx, f"Tampered payload or signature at sequence {idx}")
 
-            if self._key is not None and not self._signature_valid(event, self._key):
-                return broken(idx, f"Missing or invalid signature at sequence {idx}")
+            if self._signed and not self._signature_valid(event):
+                return broken(idx, self._signature_error(event, idx))
 
             legacy_events += event.hash_version == 1
             expected_prev = event.event_hash

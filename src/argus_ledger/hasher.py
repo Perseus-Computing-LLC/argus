@@ -166,18 +166,25 @@ def verify_signature_ed25519(event: AuditEvent, public_key_bytes: bytes) -> bool
     return True
 
 
-def verify_signature(event: AuditEvent, key: bytes) -> bool:
-    """True when the event carries a signature that matches its hash under ``key``: an HMAC-SHA256
-    key, or, for ``ed25519:`` signatures, a 32-byte Ed25519 public key or private seed."""
+SIGNATURE_SCHEMES = ("hmac", "ed25519")
+
+
+def verify_signature(event: AuditEvent, key: bytes, *, scheme: str = "hmac") -> bool:
+    """True when the event carries a valid ``scheme`` signature under ``key``.
+
+    The verifier chooses the scheme; the signature never does. ``"hmac"`` checks an HMAC-SHA256
+    signature under the secret ``key``. ``"ed25519"`` checks an ``ed25519:`` signature under the
+    32-byte public ``key``. A signature in the other scheme fails. Letting the signature choose let
+    anyone who knew an Ed25519 public key forge events: as an HMAC keyed with the public key, or as
+    an Ed25519 signature made with the public key's bytes as a private seed.
+    """
+    if scheme == "ed25519":
+        return verify_signature_ed25519(event, key)
+    if scheme != "hmac":
+        raise ValueError(f"unknown signature scheme {scheme!r}; expected one of {SIGNATURE_SCHEMES}")
     signature = event.signature
-    if not signature:
+    if not signature or signature.startswith(_ED25519_PREFIX):
         return False
-    if signature.startswith(_ED25519_PREFIX):
-        if len(key) != 32:
-            return False
-        if verify_signature_ed25519(event, key):
-            return True
-        return verify_signature_ed25519(event, ed25519_public_key(key))
     try:
         expected = sign_event_hash(event.event_hash, key, hash_version=event.hash_version)
     except ValueError:  # a non-ASCII event hash was not produced by this ledger
