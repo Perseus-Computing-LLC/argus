@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "argus-ledger"
-version = "0.1.0a4"
+version = "0.1.0a5"
 description = "Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents."
 readme = "README.md"
 authors = [
