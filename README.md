@@ -70,13 +70,13 @@ Try it without installing anything: [telarch.ai/argus](https://telarch.ai/argus)
 
 ## Measured
 
-Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) v0.1.0-alpha.7, built against argus-ledger 0.1.0-alpha.5, with synthetic data on one EC2 m8azn.metal-12xl bare-metal server. Every run, its range and the command that reproduces it are on [telarch.ai/evidence](https://telarch.ai/evidence).
+Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) v0.1.0-alpha.8, built against argus-ledger 0.1.0-alpha.5, with synthetic data on one EC2 m8azn.metal-12xl bare-metal server. Every run, its range and the command that reproduces it are on [telarch.ai/evidence](https://telarch.ai/evidence).
 
 | Measurement | Result |
 | --- | --- |
-| Appends per second, 1,000,000 events, in memory | 1,103,248 |
-| Events verified per second, full walk | 3,119,603 |
-| Time to find an edit at event 500,000 | 154.5 ms |
+| Appends per second, 1,000,000 events, in memory | 1,113,765 |
+| Events verified per second, full walk | 3,110,589 |
+| Time to find an edit at event 500,000 | 155.4 ms |
 | A fully re-hashed history passes a check without an anchor | yes |
 | The same history is caught by the anchor | yes |
 
