@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs on Node 24. Dependabot proposes weekly grouped updates for actions, Cargo and Python
   dependencies once a release is 7 days old, and an OpenSSF Scorecard workflow reports to code
   scanning.
+- Dependencies: ed25519-dalek 3, sha2 0.11 and getrandom 0.4 (`getrandom::fill` replaces
+  `getrandom::getrandom`). The MSRV rises from 1.85 to 1.88, which sha2 0.11 requires.
 
 ## [0.1.0-alpha.5] - 2026-10-22
 

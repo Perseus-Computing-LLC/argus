@@ -508,7 +508,7 @@ pub struct InMemoryLedger {
 impl Default for InMemoryLedger {
     fn default() -> Self {
         let mut id = [0u8; 16];
-        getrandom::getrandom(&mut id).expect("OS RNG unavailable; cannot derive a ledger identity");
+        getrandom::fill(&mut id).expect("OS RNG unavailable; cannot derive a ledger identity");
         let ledger_id = hex_lower(&id);
         Self {
             events: Arc::default(),

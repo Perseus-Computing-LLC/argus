@@ -33,7 +33,7 @@ jobs:
         run: cargo test --verbose
 
   test-rust-msrv:
-    name: Rust MSRV (1.85)
+    name: Rust MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -42,7 +42,7 @@ jobs:
       - name: Set up MSRV toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, pinned 2026-10-25
         with:
-          toolchain: "1.85.0"
+          toolchain: "1.88.0"
 
       - name: Cargo test on locked MSRV
         run: cargo test --locked --verbose
