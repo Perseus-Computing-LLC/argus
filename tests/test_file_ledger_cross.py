@@ -1,6 +1,8 @@
 """Cross-language compatibility tests between Python argus_ledger and Rust FileLedger."""
 
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +10,24 @@ import unittest
 from argus_ledger import AppendOnlyLedger
 from argus_ledger.hasher import compute_event_hash, compute_payload_digest
 from argus_ledger.models import GENESIS_PREV_HASH
+
+
+def _find_rust_tools() -> tuple[str, Path, Path] | None:
+    rustc = os.environ.get("RUSTC") or shutil.which("rustc")
+    if not rustc and os.path.isfile("/opt/data/home/.cargo/bin/rustc"):
+        rustc = "/opt/data/home/.cargo/bin/rustc"
+    if not rustc or not shutil.which(rustc):
+        return None
+
+    repo_root = Path(__file__).resolve().parent.parent
+    rlibs = list(repo_root.glob("target/**/libargus_ledger.rlib"))
+    if not rlibs:
+        return None
+
+    # Prefer release over debug if available
+    rlib = next((r for r in rlibs if "release" in r.parts), rlibs[0])
+    deps_dir = rlib.parent / "deps"
+    return rustc, rlib, deps_dir
 
 
 class TestFileLedgerCrossCompat(unittest.TestCase):
@@ -33,6 +53,11 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
         self.assertEqual(h1, "3a7cfe22bc8ca5b032bca7defaaa1ac22f05c9922dff2bd5032e820f1a927f9b")
 
     def test_python_writes_rust_verifies(self):
+        tools = _find_rust_tools()
+        if tools is None:
+            self.skipTest("rustc or compiled libargus_ledger.rlib not available")
+        rustc, rlib, deps_dir = tools
+
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
         rs_src = path.replace(".jsonl", "_runner.rs")
@@ -56,15 +81,17 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
             with open(rs_src, "w") as f:
                 f.write(code)
 
-            subprocess.check_output([
-                "/opt/data/home/.cargo/bin/rustc",
+            cmd = [
+                rustc,
                 "--edition=2021",
                 "--crate-name=verify_runner",
-                "--extern", "argus_ledger=/opt/data/work/telarch-suite/argus/target/debug/libargus_ledger.rlib",
-                "-L", "/opt/data/work/telarch-suite/argus/target/debug/deps",
-                rs_src,
-                "-o", rs_bin,
-            ])
+                f"--extern=argus_ledger={rlib}",
+            ]
+            if deps_dir.is_dir():
+                cmd.extend(["-L", str(deps_dir)])
+            cmd.extend([rs_src, "-o", rs_bin])
+
+            subprocess.check_output(cmd)
             subprocess.check_call([rs_bin])
         finally:
             for p in (path, rs_src, rs_bin):
@@ -72,6 +99,11 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
                     os.remove(p)
 
     def test_rust_writes_python_verifies(self):
+        tools = _find_rust_tools()
+        if tools is None:
+            self.skipTest("rustc or compiled libargus_ledger.rlib not available")
+        rustc, rlib, deps_dir = tools
+
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
         rs_src = path.replace(".jsonl", "_runner.rs")
@@ -89,15 +121,17 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
             with open(rs_src, "w") as f:
                 f.write(code)
 
-            subprocess.check_output([
-                "/opt/data/home/.cargo/bin/rustc",
+            cmd = [
+                rustc,
                 "--edition=2021",
                 "--crate-name=write_runner",
-                "--extern", "argus_ledger=/opt/data/work/telarch-suite/argus/target/debug/libargus_ledger.rlib",
-                "-L", "/opt/data/work/telarch-suite/argus/target/debug/deps",
-                rs_src,
-                "-o", rs_bin,
-            ])
+                f"--extern=argus_ledger={rlib}",
+            ]
+            if deps_dir.is_dir():
+                cmd.extend(["-L", str(deps_dir)])
+            cmd.extend([rs_src, "-o", rs_bin])
+
+            subprocess.check_output(cmd)
             subprocess.check_call([rs_bin])
 
             py_ledger = AppendOnlyLedger(path)
