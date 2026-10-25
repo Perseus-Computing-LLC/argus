@@ -59,6 +59,9 @@ use std::borrow::Borrow;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod file_ledger;
+pub use file_ledger::FileLedger;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The fixed 64-character hexadecimal previous hash for genesis events.
@@ -139,6 +142,90 @@ impl AuditEvent {
             sequence: self.sequence,
             event_hash: self.event_hash.clone(),
         }
+    }
+
+    /// Serialize event to a single-line canonical JSON record.
+    pub fn to_json_line(&self) -> String {
+        let sig = match &self.signature {
+            Some(s) => format!("\"{}\"", s),
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"sequence\":{},\"event_id\":\"{}\",\"timestamp\":\"{}\",\"event_type\":\"{}\",\"actor\":\"{}\",\"payload\":{},\"prev_hash\":\"{}\",\"event_hash\":\"{}\",\"signature\":{},\"hash_version\":2}}",
+            self.sequence,
+            self.event_id,
+            self.timestamp,
+            self.event_type,
+            self.actor,
+            self.payload,
+            self.prev_hash,
+            self.event_hash,
+            sig,
+        )
+    }
+
+    /// Parse an event from a JSON line, extracting canonical payload.
+    pub fn from_json_line(line: &str) -> Result<Self, LedgerError> {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
+        let obj = v.as_object()
+            .ok_or_else(|| LedgerError::InvalidInput("event record must be a JSON object".into()))?;
+
+        let sequence = obj.get("sequence")
+            .and_then(|s| s.as_u64())
+            .ok_or_else(|| LedgerError::InvalidInput("missing sequence".into()))?;
+
+        let event_id = obj.get("event_id")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| LedgerError::InvalidInput("missing event_id".into()))?
+            .to_string();
+
+        let timestamp = obj.get("timestamp")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| LedgerError::InvalidInput("missing timestamp".into()))?
+            .to_string();
+
+        let event_type = obj.get("event_type")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| LedgerError::InvalidInput("missing event_type".into()))?
+            .to_string();
+
+        let actor = obj.get("actor")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| LedgerError::InvalidInput("missing actor".into()))?
+            .to_string();
+
+        let payload_val = obj.get("payload")
+            .ok_or_else(|| LedgerError::InvalidInput("missing payload".into()))?;
+
+        let payload = serde_json::to_string(payload_val)
+            .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
+
+        let prev_hash = obj.get("prev_hash")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| LedgerError::InvalidInput("missing prev_hash".into()))?
+            .to_string();
+
+        let event_hash = obj.get("event_hash")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| LedgerError::InvalidInput("missing event_hash".into()))?
+            .to_string();
+
+        let signature = obj.get("signature")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+
+        Ok(Self {
+            sequence,
+            event_id,
+            timestamp,
+            event_type,
+            actor,
+            payload,
+            prev_hash,
+            event_hash,
+            signature,
+        })
     }
 }
 
@@ -489,10 +576,73 @@ impl std::io::Write for MatchesWriter<'_> {
     }
 }
 
-/// Parse a decimal `u64` in canonical form (no sign, no leading zeros).
+/// Parse a decimal `u64` in canonical form (no sign, no leading zeros), or ISO-8601 UTC timestamp.
 fn parse_canonical_u64(s: &str) -> Option<u64> {
     let canonical = s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
-    canonical.then(|| s.parse().ok()).flatten()
+    if canonical {
+        if let Ok(v) = s.parse() {
+            return Some(v);
+        }
+    }
+    parse_iso8601_nanos(s)
+}
+
+fn parse_iso8601_nanos(s: &str) -> Option<u64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 19
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let m: u64 = s.get(5..7)?.parse().ok()?;
+    let d: u64 = s.get(8..10)?.parse().ok()?;
+    let hour: u64 = s.get(11..13)?.parse().ok()?;
+    let min: u64 = s.get(14..16)?.parse().ok()?;
+    let sec: u64 = s.get(17..19)?.parse().ok()?;
+
+    if m < 1 || m > 12 || d < 1 || d > 31 || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+
+    let y_adj = y - if m <= 2 { 1 } else { 0 };
+    let era = (if y_adj >= 0 { y_adj } else { y_adj - 399 }) / 400;
+    let yoe = (y_adj - era * 400) as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe as i64 - 719468;
+    if days < 0 {
+        return None;
+    }
+    let epoch_secs = (days as u64) * 86400 + hour * 3600 + min * 60 + sec;
+
+    let mut nanos = 0u64;
+    let rest = &s[19..];
+    if rest.starts_with('.') {
+        let num_end = rest[1..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let frac_str = &rest[1..num_end];
+        let mut frac_val: u64 = frac_str.parse().ok()?;
+        let digits = frac_str.len();
+        if digits < 9 {
+            for _ in 0..(9 - digits) {
+                frac_val *= 10;
+            }
+        } else if digits > 9 {
+            for _ in 0..(digits - 9) {
+                frac_val /= 10;
+            }
+        }
+        nanos = frac_val;
+    }
+
+    Some(epoch_secs.checked_mul(1_000_000_000)?.checked_add(nanos)?)
 }
 
 /// Thread-safe in-memory reference implementation of an append-only audit ledger.

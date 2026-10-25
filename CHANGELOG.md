@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependencies: ed25519-dalek 3, sha2 0.11 and getrandom 0.4 (`getrandom::fill` replaces
   `getrandom::getrandom`). The MSRV rises from 1.85 to 1.88, which sha2 0.11 requires.
 
+## [0.1.0-alpha.6] - 2026-10-25
+
+### Added
+- Rust: native `FileLedger` supporting persistent append-only storage in JSON-L format with Unix `0600` permissions, POSIX advisory file locking, and `sync_data()` durability.
+- Rust: implemented `AuditLedgerWriter`, `AuditLedgerReader`, and `AuditVerifier` traits on `FileLedger`.
+- Interoperability: verified byte-for-byte SHA-256 canonical JSON hash parity and cross-language verification between Python `AppendOnlyLedger` and Rust `FileLedger`.
+
 ## [0.1.0-alpha.5] - 2026-10-22
 
 ### Security

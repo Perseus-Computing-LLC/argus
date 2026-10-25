@@ -569,3 +569,108 @@ fn f4_signatures_match_an_independent_openssl_implementation() {
         public.as_bytes()
     ));
 }
+
+#[test]
+fn test_file_ledger_create_permissions_and_sync() {
+    let tmp = tempfile_dir("file_ledger_perms");
+    let path = tmp.join("audit.jsonl");
+
+    let ledger = crate::FileLedger::new(&path).expect("open ledger");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "ledger file must be created with 0600 permissions"
+        );
+    }
+
+    let ev1 = ledger
+        .append("agent.startup", "coordinator", "{\"status\":\"ok\"}")
+        .expect("append ev1");
+    assert_eq!(ev1.sequence, 1);
+    assert_eq!(ev1.prev_hash, GENESIS_PREV_HASH);
+
+    let ev2 = ledger
+        .append("tool.exec", "worker_1", "{\"command\":\"test\"}")
+        .expect("append ev2");
+    assert_eq!(ev2.sequence, 2);
+    assert_eq!(ev2.prev_hash, ev1.event_hash);
+
+    let head = ledger.head().expect("head").expect("some head");
+    assert_eq!(head.sequence, 2);
+    assert_eq!(head.event_hash, ev2.event_hash);
+
+    let report = ledger.verify_chain().expect("verify");
+    assert!(report.valid);
+    assert_eq!(report.total_events, 2);
+
+    std::fs::remove_dir_all(tmp).ok();
+}
+
+#[test]
+fn test_file_ledger_golden_hash_parity_and_cross_compat() {
+    let tmp = tempfile_dir("file_ledger_golden");
+    let path = tmp.join("audit.jsonl");
+
+    let ledger = crate::FileLedger::new(&path).expect("open");
+
+    // Golden vector 1: "{\"command\":\"build\"}"
+    let payload1 = "{\"command\":\"build\"}";
+    let digest1 = crate::compute_payload_digest(payload1);
+    assert_eq!(
+        digest1,
+        "e053d91e793d447a4d3c889162d6303593a89b5c9323850ffcaa6465e5b42345"
+    );
+
+    // Empty payload digest: "{}"
+    let digest_empty = crate::compute_payload_digest("{}");
+    assert_eq!(
+        digest_empty,
+        "98db375430d9d7e035552d94f599855e44b9257f5151438a065fa59c583ec93a"
+    );
+
+    let ev = ledger
+        .append("tool.exec", "arn:aws:iam::123456789012:user/alice", payload1)
+        .expect("append");
+
+    // Override event_hash computation test against golden hash
+    let golden_event_hash = crate::compute_event_hash(
+        1,
+        "ev_0123456789abcdef0123456789abcdef_1",
+        "1760659200000000000",
+        "tool.exec",
+        "arn:aws:iam::123456789012:user/alice",
+        GENESIS_PREV_HASH,
+        payload1,
+    );
+    assert_eq!(
+        golden_event_hash,
+        "3a7cfe22bc8ca5b032bca7defaaa1ac22f05c9922dff2bd5032e820f1a927f9b"
+    );
+
+    // Verify all_events reads correctly
+    let all = ledger.all_events().expect("all_events");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].sequence, 1);
+    assert_eq!(all[0].event_hash, ev.event_hash);
+
+    let report = ledger.verify_chain().expect("verify");
+    assert!(report.valid);
+
+    std::fs::remove_dir_all(tmp).ok();
+}
+
+fn tempfile_dir(prefix: &str) -> std::path::PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("argus_test_{}_{}", prefix, nanos));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}

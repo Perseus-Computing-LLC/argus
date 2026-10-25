@@ -17,22 +17,22 @@ Agents run commands, call APIs and edit files. Afterwards the log is the only ac
 - **Edits found, with their position.** Verification walks the chain and reports the first event whose hash or link does not check out.
 - **Anchors for full rewrites.** Keep the latest sequence number and hash somewhere the writer cannot change. Verifying against that anchor catches a history that was rewritten, rolled back or truncated.
 - **Optional signatures.** With a signing key, each event also carries an HMAC-SHA256 or Ed25519 signature that verification checks.
-- **Local storage.** The Python package writes a JSON Lines file under a file lock; the Rust crate keeps the ledger in memory.
+- **Local storage.** Both the Rust crate (`FileLedger`) and the Python package (`AppendOnlyLedger`) write a JSON Lines file under a POSIX file lock with `0600` permissions and `sync_data` durability. The Rust crate additionally provides `InMemoryLedger`.
 - **No network code.** The ledger runs locally and sends nothing anywhere.
 
 ## Install
 
-This README describes 0.1.0-alpha.5 (0.1.0a5 on PyPI). It is a pre-release, so name the version.
+This README describes 0.1.0-alpha.6 (0.1.0a6 on PyPI). It is a pre-release, so name the version.
 
 ```toml
 # Rust: Cargo.toml
 [dependencies]
-argus-ledger = "0.1.0-alpha.5"
+argus-ledger = "0.1.0-alpha.6"
 ```
 
 ```bash
 # Python
-pip install argus-ledger==0.1.0a5
+pip install argus-ledger==0.1.0a6
 ```
 
 ## Quickstart
