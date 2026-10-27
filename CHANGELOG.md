@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `argus-verify` reported an event-hash mismatch on records whose payload holds a float the Python
+  writer serialized with 16-17 significant digits (e.g. `-9.865914147294541`): serde_json's default
+  float parser is not correctly rounded, so the value re-serialized as `-9.86591414729454` and the
+  payload digest changed. `serde_json` now builds with `float_roundtrip`; a Python-written ledger
+  with such payloads verifies again. The Rust writer still refuses floats
+  (`validate_canonical_payload`); the Python writer accepts them, which is the remaining parity gap,
+  and floats Python prints in exponent form (`1e-07`, `1e+308`) still differ from serde's `1e-7`, `1e308`.
+
 ### Changed
 - CI: every action is pinned to a full commit SHA (the Rust toolchain action followed a branch) and
   runs on Node 24. Dependabot proposes weekly grouped updates for actions, Cargo and Python

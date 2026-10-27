@@ -98,6 +98,56 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
                 if os.path.exists(p):
                     os.remove(p)
 
+    def test_python_float_payload_verifies_with_argus_verify(self):
+        """A float the Python writer prints with 16 digits must hash the same in the Rust verifier."""
+        binary = shutil.which("argus-verify")
+        for candidate in (Path(__file__).resolve().parents[1] / "target" / "release" / "argus-verify",
+                          Path(__file__).resolve().parents[1] / "target" / "debug" / "argus-verify"):
+            if candidate.is_file():
+                binary = str(candidate)
+                break
+        if not binary:
+            self.skipTest("argus-verify binary not built")
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+        try:
+            ledger = AppendOnlyLedger(path)
+            ledger.append("tool_execution", "hermes_agent", {"tool": "kibisis_recall", "top_score": -9.865914147294541})
+            ledger.append("tool_execution", "hermes_agent", {"ratio": 0.1 + 0.2, "half": 0.5, "neg": -1234.5678})
+            self.assertTrue(ledger.verify_chain().valid)
+            run = subprocess.run([binary, "--json", path], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertIn('"valid":true', run.stdout)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    @unittest.expectedFailure
+    def test_python_exponent_float_payload_known_gap(self):
+        """Known parity gap: Python repr writes `1e-07` / `1e+308`, serde_json writes `1e-7` / `1e308`.
+
+        The Python writer should refuse floats (as the Rust writer does) or format them the Rust
+        way; until then a ledger with exponent-form floats verifies in Python but not in Rust.
+        """
+        binary = shutil.which("argus-verify")
+        for candidate in (Path(__file__).resolve().parents[1] / "target" / "release" / "argus-verify",
+                          Path(__file__).resolve().parents[1] / "target" / "debug" / "argus-verify"):
+            if candidate.is_file():
+                binary = str(candidate)
+                break
+        if not binary:
+            self.skipTest("argus-verify binary not built")
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+        try:
+            ledger = AppendOnlyLedger(path)
+            ledger.append("tool_execution", "hermes_agent", {"small": 1e-7, "big": 1.7976931348623157e308})
+            run = subprocess.run([binary, "--json", path], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
     def test_rust_writes_python_verifies(self):
         tools = _find_rust_tools()
         if tools is None:
