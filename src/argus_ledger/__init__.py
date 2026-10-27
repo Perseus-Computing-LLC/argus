@@ -1,7 +1,7 @@
 """argus-ledger: Tamper-evident append-only SHA-256 provenance and audit ledger for autonomous agents."""
 
 from .models import AuditEvent, ChainAnchor, ChainVerificationReport, CURRENT_HASH_VERSION, GENESIS_PREV_HASH
-from .canonical import canonical_json_bytes, canonical_json_dumps
+from .canonical import canonical_json_bytes, canonical_json_dumps, FloatPayloadError, reject_float_payload
 from .hasher import (
     SIGNATURE_DOMAIN,
     compute_event_hash,
@@ -32,9 +32,11 @@ from .proofweave import (
     RAGTriadBinding,
 )
 
-__version__ = "0.1.0a6"
+__version__ = "0.1.0a7"
 
 __all__ = [
+    "FloatPayloadError",
+    "reject_float_payload",
     "AuditEvent",
     "ChainVerificationReport",
     "GENESIS_PREV_HASH",

@@ -15,6 +15,18 @@ Subject: `[SECURITY] Argus Vulnerability Report`
 - **Triage & Status**: Within 5 business days.
 - **Fix & Advisory**: Within 14 calendar days for verified high/critical vulnerabilities.
 
+## Known issues and notes
+
+### 2026-10-27 — alpha.6 `argus-verify` could not verify float payloads written by the Python library
+`argus-verify` 0.1.0-alpha.6 reported an event-hash mismatch on a record whose payload held a 16-digit
+float written by the Python writer (`-9.865914147294541`); serde_json's default parser read it inexactly,
+so the recomputed payload digest differed. The Python verifier accepted the same ledger. Impact: an
+independent (Rust) verification of such a ledger failed when it should have passed; no record could be
+altered or forged by this. Fixed in 0.1.0-alpha.7: the verifier parses floats correctly rounded
+(`float_roundtrip`) and the Python writer refuses floats at `append()`, as the Rust writer already did.
+Operators who anchored a ledger with alpha.6 should re-verify with alpha.7; the anchors themselves are
+unaffected. Details: CHANGELOG 0.1.0-alpha.7.
+
 ## Scope
 - Argus records events in a linear SHA-256 hash chain. It runs inside your process and has no network code or telemetry.
 - Verification checks sequence numbers, hash links and event hashes, and signatures when given a key. It reports the first broken position (`first_broken_sequence`).

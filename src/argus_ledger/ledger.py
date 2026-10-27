@@ -19,6 +19,7 @@ from .hasher import (
 )
 from .models import CURRENT_HASH_VERSION, AuditEvent, ChainAnchor, ChainVerificationReport, GENESIS_PREV_HASH
 from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier, LedgerCorruptionError
+from .canonical import reject_float_payload
 
 _TAIL_BLOCK = 1 << 16
 
@@ -109,6 +110,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         eid = event_id or str(uuid.uuid4())
         if self._key is None and self._ed25519_public_key is not None:
             raise PermissionError("this ledger was opened with verify_key: it can check signatures but not append")
+        reject_float_payload(payload)
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         with open(self.ledger_path, "a+", encoding="utf-8") as f:

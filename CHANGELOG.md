@@ -7,16 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.7] - 2026-10-27
+
+### Security / correctness note — float payloads and the Rust verifier (found 2026-10-27)
+On a production ledger of 32,908 events, `argus-verify 0.1.0-alpha.6` reported
+`Event hash mismatch at seq 30936` while the Python `verify_chain()` passed. The record's payload held
+`"top_score": -9.865914147294541`, written by the Python library (shortest round-trip repr, 16 digits).
+serde_json's default float parser is not correctly rounded; it read the value as `-9.86591414729454`,
+re-serialized it that way, and the payload digest changed. 41 of the 32,908 events carried floats
+(22 `tool_execution` from the Kibisis plugin's `top_score`, 19 `tci.self_improvement_cycle`). The chain
+itself was intact: this was a verifier defect, not tampering, but it meant the released Rust verifier
+could not independently confirm a ledger the Python library had written.
+
 ### Fixed
-- `argus-verify` reported an event-hash mismatch on records whose payload holds a float the Python
-  writer serialized with 16-17 significant digits (e.g. `-9.865914147294541`): serde_json's default
-  float parser is not correctly rounded, so the value re-serialized as `-9.86591414729454` and the
-  payload digest changed. `serde_json` now builds with `float_roundtrip`; a Python-written ledger
-  with such payloads verifies again. The Rust writer still refuses floats
-  (`validate_canonical_payload`); the Python writer accepts them, which is the remaining parity gap,
-  and floats Python prints in exponent form (`1e-07`, `1e+308`) still differ from serde's `1e-7`, `1e308`.
+- `argus-verify` builds `serde_json` with `float_roundtrip`, so historical float payloads
+  (any ledger written before this release) verify again. Kept permanently: the ledger is append-only.
 
 ### Changed
+- **The Python writer now refuses floats** (`FloatPayloadError` from `AppendOnlyLedger.append`), matching the
+  Rust writer's `validate_canonical_payload`. Nothing is written when the check fails. Callers pass integers
+  (basis points, micro-units, milliseconds) or fixed-format strings (`f"{x:.6f}"`); the two writers then
+  produce byte-identical canonical JSON and neither side depends on IEEE-754 formatting (`1e-07` vs `1e-7`,
+  16- vs 17-digit shortest repr). `reject_float_payload()` is exported for callers that want to check early.
 - CI: every action is pinned to a full commit SHA (the Rust toolchain action followed a branch) and
   runs on Node 24. Dependabot proposes weekly grouped updates for actions, Cargo and Python
   dependencies once a release is 7 days old, and an OpenSSF Scorecard workflow reports to code

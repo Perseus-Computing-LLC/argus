@@ -12,6 +12,19 @@ from argus_ledger.hasher import compute_event_hash, compute_payload_digest
 from argus_ledger.models import GENESIS_PREV_HASH
 
 
+def _argus_verify_binary() -> str | None:
+    for candidate in (Path(__file__).resolve().parents[1] / "target" / "release" / "argus-verify",
+                      Path(__file__).resolve().parents[1] / "target" / "debug" / "argus-verify"):
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("argus-verify")
+
+
+def _count_lines(path: str) -> int:
+    with open(path, "rb") as fh:
+        return sum(1 for line in fh if line.strip())
+
+
 def _find_rust_tools() -> tuple[str, Path, Path] | None:
     rustc = os.environ.get("RUSTC") or shutil.which("rustc")
     if not rustc and os.path.isfile("/opt/data/home/.cargo/bin/rustc"):
@@ -98,52 +111,46 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
                 if os.path.exists(p):
                     os.remove(p)
 
-    def test_python_float_payload_verifies_with_argus_verify(self):
-        """A float the Python writer prints with 16 digits must hash the same in the Rust verifier."""
-        binary = shutil.which("argus-verify")
-        for candidate in (Path(__file__).resolve().parents[1] / "target" / "release" / "argus-verify",
-                          Path(__file__).resolve().parents[1] / "target" / "debug" / "argus-verify"):
-            if candidate.is_file():
-                binary = str(candidate)
-                break
-        if not binary:
-            self.skipTest("argus-verify binary not built")
+    def test_python_writer_rejects_floats_like_rust(self):
+        """Parity: the Python writer refuses float payloads exactly as validate_canonical_payload does."""
+        from argus_ledger import FloatPayloadError
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
         try:
             ledger = AppendOnlyLedger(path)
-            ledger.append("tool_execution", "hermes_agent", {"tool": "kibisis_recall", "top_score": -9.865914147294541})
-            ledger.append("tool_execution", "hermes_agent", {"ratio": 0.1 + 0.2, "half": 0.5, "neg": -1234.5678})
+            for bad in ({"top_score": -9.865914147294541}, {"nested": {"ratio": 0.1 + 0.2}}, {"xs": [1, 2.5]}, {"e": 1e-7}):
+                with self.assertRaises(FloatPayloadError):
+                    ledger.append("tool_execution", "hermes_agent", bad)
+            self.assertEqual(_count_lines(path), 0)
+            ledger.append("tool_execution", "hermes_agent", {"top_score_bp": -98659, "duration_ms": 12, "ok": True, "note": "-9.865914"})
             self.assertTrue(ledger.verify_chain().valid)
-            run = subprocess.run([binary, "--json", path], capture_output=True, text=True)
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            self.assertIn('"valid":true', run.stdout)
         finally:
             if os.path.exists(path):
                 os.remove(path)
 
-    @unittest.expectedFailure
-    def test_python_exponent_float_payload_known_gap(self):
-        """Known parity gap: Python repr writes `1e-07` / `1e+308`, serde_json writes `1e-7` / `1e308`.
-
-        The Python writer should refuse floats (as the Rust writer does) or format them the Rust
-        way; until then a ledger with exponent-form floats verifies in Python but not in Rust.
-        """
-        binary = shutil.which("argus-verify")
-        for candidate in (Path(__file__).resolve().parents[1] / "target" / "release" / "argus-verify",
-                          Path(__file__).resolve().parents[1] / "target" / "debug" / "argus-verify"):
-            if candidate.is_file():
-                binary = str(candidate)
-                break
+    def test_argus_verify_still_reads_historical_float_payloads(self):
+        """Ledgers written before alpha.7 hold floats; the Rust verifier (float_roundtrip) must still verify them."""
+        binary = _argus_verify_binary()
         if not binary:
             self.skipTest("argus-verify binary not built")
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
         try:
             ledger = AppendOnlyLedger(path)
-            ledger.append("tool_execution", "hermes_agent", {"small": 1e-7, "big": 1.7976931348623157e308})
+            # bypass the alpha.7 guard the way a pre-alpha.7 writer would have: write the record directly
+            from argus_ledger import canonical  # noqa: F401
+            import argus_ledger.ledger as L
+            saved = L.reject_float_payload
+            L.reject_float_payload = lambda *_a, **_k: None
+            try:
+                ledger.append("tool_execution", "hermes_agent", {"tool": "kibisis_recall", "top_score": -9.865914147294541})
+                ledger.append("tool_execution", "hermes_agent", {"ratio": 0.1 + 0.2, "half": 0.5, "neg": -1234.5678})
+            finally:
+                L.reject_float_payload = saved
+            self.assertTrue(ledger.verify_chain().valid)
             run = subprocess.run([binary, "--json", path], capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertIn('"valid":true', run.stdout)
         finally:
             if os.path.exists(path):
                 os.remove(path)

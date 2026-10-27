@@ -23,6 +23,33 @@ def canonical_json_dumps(obj: Any) -> str:
     )
 
 
+class FloatPayloadError(ValueError):
+    """A payload holds an IEEE-754 float; the two writers would not agree on its text."""
+
+
+def reject_float_payload(obj: Any, path: str = "payload") -> None:
+    """Refuse ``float`` anywhere in a payload, as the Rust writer's ``validate_canonical_payload`` does.
+
+    Python prints the shortest round-trip repr (``-9.865914147294541``, ``1e-07``); serde_json prints
+    ``1e-7`` and, without the ``float_roundtrip`` feature, parses 16-17 digit values inexactly. Either
+    difference changes the payload digest, so the verifier on one side rejects what the other wrote.
+    Callers pass integers (basis points, micro-units, milliseconds) or fixed-format strings instead.
+    """
+    if isinstance(obj, bool) or obj is None:
+        return
+    if isinstance(obj, float):
+        raise FloatPayloadError(
+            f"{path} is a float ({obj!r}); store an integer (e.g. basis points or micro-units) or a "
+            f"fixed-format string such as f\"{{x:.6f}}\" so Python and Rust hash the same bytes"
+        )
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            reject_float_payload(v, f"{path}.{k}")
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            reject_float_payload(v, f"{path}[{i}]")
+
+
 def canonical_json_bytes(obj: Any) -> bytes:
     """Return UTF-8 encoded bytes for canonical JSON serialization."""
     return canonical_json_dumps(obj).encode("utf-8")
