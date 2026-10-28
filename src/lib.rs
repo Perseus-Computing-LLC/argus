@@ -624,8 +624,11 @@ impl std::io::Write for MatchesWriter<'_> {
     }
 }
 
-/// Parse a decimal `u64` in canonical form (no sign, no leading zeros), or ISO-8601 UTC timestamp.
-fn parse_canonical_u64(s: &str) -> Option<u64> {
+/// Parse a record timestamp to nanoseconds since the UNIX epoch: either a decimal `u64` in
+/// canonical form (no sign, no leading zeros; what the Rust writers emit) or an RFC 3339 date-time
+/// with any UTC offset (what the Python writer emits). Both forms compare as instants, so the
+/// timestamp contract, strictly increasing within a ledger, holds across writers.
+pub fn parse_timestamp_nanos(s: &str) -> Option<u64> {
     let canonical = s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
     if canonical {
         if let Ok(v) = s.parse() {
@@ -635,7 +638,33 @@ fn parse_canonical_u64(s: &str) -> Option<u64> {
     parse_iso8601_nanos(s)
 }
 
+/// Split a trailing `Z`, `+hh:mm` or `-hh:mm` off an ISO-8601 string and return the offset in
+/// seconds east of UTC. No suffix is treated as UTC. Returns None for a malformed offset.
+/// Before this existed `+05:00` records failed to parse and `Z` records were read as UTC only by
+/// luck of the fraction parser, so Python-written ledgers could not be verified by this crate.
+fn split_utc_offset(s: &str) -> Option<(&str, i64)> {
+    if let Some(body) = s.strip_suffix('Z') {
+        return Some((body, 0));
+    }
+    let Some(cut) = s.len().checked_sub(6) else {
+        return Some((s, 0));
+    };
+    let (body, off) = s.split_at(cut);
+    let sign = match off.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return Some((s, 0)), // no offset present (e.g. ends in fraction digits)
+    };
+    if off.as_bytes()[3] != b':' {
+        return None;
+    }
+    let hh: i64 = off[1..3].parse().ok()?;
+    let mm: i64 = off[4..6].parse().ok()?;
+    (hh <= 14 && mm <= 59).then_some((body, sign * (hh * 3600 + mm * 60)))
+}
+
 fn parse_iso8601_nanos(s: &str) -> Option<u64> {
+    let (s, offset_secs) = split_utc_offset(s)?;
     let bytes = s.as_bytes();
     if bytes.len() < 19
         || bytes.get(4) != Some(&b'-')
@@ -653,44 +682,37 @@ fn parse_iso8601_nanos(s: &str) -> Option<u64> {
     let min: u64 = s.get(14..16)?.parse().ok()?;
     let sec: u64 = s.get(17..19)?.parse().ok()?;
 
-    if m < 1 || m > 12 || d < 1 || d > 31 || hour > 23 || min > 59 || sec > 60 {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hour > 23 || min > 59 || sec > 60 {
         return None;
     }
 
+    // Days from civil (Howard Hinnant's algorithm), valid for the proleptic Gregorian calendar.
     let y_adj = y - if m <= 2 { 1 } else { 0 };
     let era = (if y_adj >= 0 { y_adj } else { y_adj - 399 }) / 400;
     let yoe = (y_adj - era * 400) as u64;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe as i64 - 719468;
-    if days < 0 {
-        return None;
-    }
-    let epoch_secs = (days as u64) * 86400 + hour * 3600 + min * 60 + sec;
+    let local_secs = days * 86400 + (hour * 3600 + min * 60 + sec) as i64;
+    let epoch_secs = u64::try_from(local_secs - offset_secs).ok()?;
 
     let mut nanos = 0u64;
-    let rest = &s[19..];
-    if rest.starts_with('.') {
-        let num_end = rest[1..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map(|i| i + 1)
-            .unwrap_or(rest.len());
-        let frac_str = &rest[1..num_end];
-        let mut frac_val: u64 = frac_str.parse().ok()?;
-        let digits = frac_str.len();
-        if digits < 9 {
-            for _ in 0..(9 - digits) {
-                frac_val *= 10;
-            }
-        } else if digits > 9 {
-            for _ in 0..(digits - 9) {
-                frac_val /= 10;
-            }
+    if let Some(frac) = s[19..].strip_prefix('.') {
+        // Only digits may follow the dot now that the offset has been split off.
+        if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let digits = frac.len().min(9);
+        let mut frac_val: u64 = frac[..digits].parse().ok()?;
+        for _ in digits..9 {
+            frac_val *= 10;
         }
         nanos = frac_val;
+    } else if s.len() != 19 {
+        return None;
     }
 
-    Some(epoch_secs.checked_mul(1_000_000_000)?.checked_add(nanos)?)
+    epoch_secs.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
 /// Thread-safe in-memory reference implementation of an append-only audit ledger.
@@ -776,9 +798,10 @@ impl AuditLedgerWriter for InMemoryLedger {
         };
 
         // Strictly increasing within the ledger, even if the host clock steps backwards.
+        // The last record may be in either form (a Python writer may have appended before us).
         let timestamp = store
             .last()
-            .and_then(|last| last.timestamp.parse::<u64>().ok())
+            .and_then(|last| parse_timestamp_nanos(&last.timestamp))
             .map_or(now_ns, |last_ns| now_ns.max(last_ns.saturating_add(1)))
             .to_string();
         let event_id = format!("ev_{}_{}", self.ledger_id, sequence);
@@ -960,7 +983,7 @@ impl<'a> ChainVerifier<'a> {
             let detail = format!("tampered content hash at sequence {seq}");
             return Some(self.report(seq, LedgerError::HashMismatch(detail)));
         }
-        let Some(timestamp) = parse_canonical_u64(&event.timestamp)
+        let Some(timestamp) = parse_timestamp_nanos(&event.timestamp)
             .filter(|&ns| self.prev_timestamp.is_none_or(|prev| ns > prev))
         else {
             let detail = format!("timestamp at sequence {seq} is malformed or not increasing");

@@ -521,7 +521,7 @@ fn opt_canonical_u64_parse_matches_the_allocating_reference() {
         "018446744073709551615",
         "1783000000000000000",
     ] {
-        assert_eq!(parse_canonical_u64(s), reference(s), "input {s:?}");
+        assert_eq!(parse_timestamp_nanos(s), reference(s), "input {s:?}");
     }
 }
 
@@ -908,6 +908,71 @@ fn rv_f2_file_ledger_verify_fails_closed_on_a_malformed_line() {
     assert_eq!(report.total_events, 3);
     assert!(matches!(report.failure, Some(LedgerError::InvalidInput(_))));
     assert_eq!(report.head_hash, ev2.event_hash);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// F5: timestamps compare as instants whatever their written form, so the Python package's
+/// RFC 3339 records (with `+00:00`, another offset, `Z` or no suffix) and the Rust writers'
+/// nanosecond integers obey one strictly-increasing rule.
+#[test]
+fn rv_f5_timestamps_parse_as_instants_across_offsets_and_forms() {
+    const T: u64 = 1_793_145_600_000_000_000; // 2026-10-28T00:00:00Z
+    for (text, expect) in [
+        ("1793145600000000000", Some(T)),
+        ("2026-10-28T00:00:00+00:00", Some(T)),
+        ("2026-10-28T00:00:00Z", Some(T)),
+        ("2026-10-28T00:00:00", Some(T)),
+        ("2026-10-28T05:00:00+05:00", Some(T)),
+        ("2026-10-27T19:30:00-04:30", Some(T)),
+        ("2026-10-28T00:00:00.123456+00:00", Some(T + 123_456_000)),
+        ("2026-10-28T00:00:00.123456789Z", Some(T + 123_456_789)),
+        ("2026-10-28T00:00:00.1234567891Z", Some(T + 123_456_789)),
+        ("2026-10-28T00:00:00.+00:00", None),
+        ("2026-10-28T00:00:00+0500", None),
+        ("2026-10-28T00:00:00+15:00", None),
+        ("2026-10-28T00:00:00+05:60", None),
+        ("2026-10-28T00:00:00x", None),
+        ("2026-13-28T00:00:00Z", None),
+        ("01793145600000000000", None),
+        ("", None),
+    ] {
+        assert_eq!(parse_timestamp_nanos(text), expect, "{text:?}");
+    }
+    // Textually later, earlier as an instant: the verifier must compare instants.
+    let a = parse_timestamp_nanos("2026-10-28T00:00:00+00:00").unwrap();
+    let b = parse_timestamp_nanos("2026-10-28T04:59:59+05:00").unwrap();
+    assert!(b < a);
+}
+
+/// A Rust writer appending after a Python record (RFC 3339) still produces a strictly later
+/// instant, even if the host clock is behind that record.
+#[test]
+fn rv_f5_rust_writer_stays_monotonic_after_a_python_written_record() {
+    let dir = tempfile_dir("rv_f5");
+    let path = dir.join("audit.jsonl");
+    let far_future = "2500-01-01T00:00:00.000000+00:00";
+    let mut first = AuditEvent {
+        sequence: 1,
+        event_id: "py-1".into(),
+        timestamp: far_future.into(),
+        event_type: "tool.exec".into(),
+        actor: "agent".into(),
+        payload: "{}".into(),
+        prev_hash: GENESIS_PREV_HASH.into(),
+        event_hash: String::new(),
+        signature: None,
+        hash_version: 2,
+    };
+    first.event_hash = compute_event_hash(1, "py-1", far_future, "tool.exec", "agent", GENESIS_PREV_HASH, "{}");
+    std::fs::write(&path, first.to_json_line() + "\n").unwrap();
+    let ledger = FileLedger::new(&path).unwrap();
+    let second = ledger.append("tool.exec", "agent", "{}").unwrap();
+    assert_eq!(
+        parse_timestamp_nanos(&second.timestamp),
+        Some(parse_timestamp_nanos(far_future).unwrap() + 1)
+    );
+    let report = ledger.verify_chain().unwrap();
+    assert!(report.valid, "{:?}", report.error_detail);
     let _ = std::fs::remove_dir_all(dir);
 }
 

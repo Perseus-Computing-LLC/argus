@@ -246,11 +246,13 @@ impl AuditLedgerWriter for FileLedger {
                     (
                         last_ev.sequence + 1,
                         last_ev.event_hash,
-                        last_ev.timestamp.parse::<u64>().ok(),
+                        crate::parse_timestamp_nanos(&last_ev.timestamp),
                     )
                 }
             };
 
+            // Strictly increasing within the ledger, even if the host clock steps backwards or
+            // the previous record was written by the Python package in RFC 3339 form.
             let timestamp = last_ts
                 .map_or(now_ns, |lts| now_ns.max(lts.saturating_add(1)))
                 .to_string();

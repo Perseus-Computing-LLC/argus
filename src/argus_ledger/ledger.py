@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import datetime
 import fcntl
 import json
@@ -20,6 +21,7 @@ from .hasher import (
 from .models import CURRENT_HASH_VERSION, AuditEvent, ChainAnchor, ChainVerificationReport, GENESIS_PREV_HASH
 from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier, LedgerCorruptionError
 from .canonical import reject_float_payload
+from .timestamps import timestamp_nanos
 
 _TAIL_BLOCK = 1 << 16
 
@@ -37,6 +39,21 @@ def _tail_record(fd: int) -> Optional[bytes]:
         if record and (newline >= 0 or pos == 0):
             return record[newline + 1:].strip()
     return None
+
+
+def _monotonic_utc_iso(last_instant: Optional[int]) -> str:
+    """Current UTC time as RFC 3339, forced at least one microsecond past ``last_instant`` (ns)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if last_instant is not None:
+        now_ns = (calendar.timegm(now.timetuple()) * 1_000_000 + now.microsecond) * 1000
+        floor_ns = last_instant + 1
+        if now_ns < floor_ns:
+            # Round up to the next whole microsecond so the emitted (microsecond) text is still
+            # strictly after a nanosecond-resolution Rust record.
+            floor_us = -(-floor_ns // 1000)
+            now = datetime.datetime.fromtimestamp(floor_us / 1_000_000, datetime.timezone.utc)
+            now = now.replace(microsecond=floor_us % 1_000_000)
+    return now.isoformat()
 
 
 def _count_records(path: str) -> int:
@@ -111,7 +128,6 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         if self._key is None and self._ed25519_public_key is not None:
             raise PermissionError("this ledger was opened with verify_key: it can check signatures but not append")
         reject_float_payload(payload)
-        now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         with open(self.ledger_path, "a+", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -119,6 +135,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                 size = os.fstat(f.fileno()).st_size
                 tail = _tail_record(f.fileno())
 
+                last_instant: Optional[int] = None
                 if tail is None:
                     sequence = 1
                     prev_hash = GENESIS_PREV_HASH
@@ -127,11 +144,18 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                         last_obj = json.loads(tail)
                         sequence = int(last_obj["sequence"]) + 1
                         prev_hash = str(last_obj["event_hash"])
+                        last_instant = timestamp_nanos(last_obj.get("timestamp", ""))
                     except (ValueError, KeyError, TypeError) as exc:
                         raise LedgerCorruptionError(
                             "Cannot append to ledger with corrupted tail record at line "
                             f"{_count_records(self.ledger_path)}: {exc}"
                         ) from exc
+
+                # Strictly increasing within the ledger even if the host clock steps backwards
+                # (seen in production: 47 decreasing transitions in 34k records). The guard is
+                # taken under the lock so two writers cannot pick the same instant. Format is
+                # unchanged: RFC 3339 UTC, explicit +00:00, microsecond resolution.
+                now_ts = _monotonic_utc_iso(last_instant)
 
                 event_hash = compute_event_hash(
                     sequence=sequence,
@@ -289,6 +313,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         head_hash = ""
         legacy_events = 0
         expected_prev = GENESIS_PREV_HASH
+        prev_instant: Optional[int] = None
         anchor_matched = False
 
         def broken(at: int, detail: str) -> ChainVerificationReport:
@@ -329,6 +354,12 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             if not verify_event(event):
                 return broken(idx, f"Tampered payload or signature at sequence {idx}")
 
+            # Timestamp contract (shared with the Rust crate and argus-verify): strictly
+            # increasing as instants, so a replayed or back-dated record cannot be spliced in.
+            instant = timestamp_nanos(event.timestamp)
+            if instant is None or (prev_instant is not None and instant <= prev_instant):
+                return broken(idx, f"Timestamp at sequence {idx} is malformed or not increasing")
+
             if self._signed and not self._signature_valid(event):
                 return broken(idx, self._signature_error(event, idx))
 
@@ -339,6 +370,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
 
             legacy_events += event.hash_version == 1
             expected_prev = event.event_hash
+            prev_instant = instant
             if idx == 1:
                 root_hash = event.event_hash
             head_hash = event.event_hash

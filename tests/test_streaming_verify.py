@@ -27,7 +27,7 @@ class StreamingVerifyTest(unittest.TestCase):
             fields = dict(
                 sequence=seq,
                 event_id=f"ev_{seq}",
-                timestamp=f"2026-10-28T00:00:{i % 60:02d}.{i // 60:06d}+00:00",
+                timestamp=f"2026-10-28T00:{i // 60000:02d}:{(i // 1000) % 60:02d}.{(i % 1000) * 1000:06d}+00:00",
                 event_type="tool.exec",
                 actor="agent",
                 prev_hash=prev,
