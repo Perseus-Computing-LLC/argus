@@ -29,6 +29,7 @@ ARGS:
 
 OPTIONS:
     --anchor <SEQ>:<HASH>   Verify the chain witnesses a known sequence and event hash
+    --anchor-file <PATH>    Verify the chain witnesses checkpoints from an external anchor file
     --legacy-timestamps-before <SEQ>
                             Accept-as-historic: below sequence SEQ (>= 1), a timestamp that is
                             not strictly after its predecessor's is counted and warned about
@@ -207,6 +208,7 @@ fn main() {
     let mut json_mode = false;
     let mut benchmark_mode = false;
     let mut anchor: Option<ChainAnchor> = None;
+    let mut file_anchors: Vec<ChainAnchor> = Vec::new();
     let mut legacy_timestamps_before: Option<u64> = None;
 
     let mut i = 1;
@@ -239,6 +241,71 @@ fn main() {
                         eprintln!("Error: --legacy-timestamps-before must be an integer >= 1");
                         std::process::exit(2);
                     }
+                }
+            }
+            "--anchor-file" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --anchor-file requires <PATH>");
+                    std::process::exit(2);
+                }
+                let file_path = PathBuf::from(&args[i]);
+                if !file_path.exists() {
+                    eprintln!("Error: anchor file not found: {}", file_path.display());
+                    std::process::exit(2);
+                }
+                let content = match std::fs::read_to_string(&file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error: failed to read anchor file: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                let val: serde_json::Value = match serde_json::from_str(&content) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Error: invalid JSON in anchor file: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                let checkpoints_arr =
+                    if let Some(arr) = val.get("checkpoints").and_then(|c| c.as_array()) {
+                        arr.clone()
+                    } else if let Some(arr) = val.as_array() {
+                        arr.clone()
+                    } else if val.is_object() {
+                        vec![val]
+                    } else {
+                        eprintln!("Error: anchor file must contain a checkpoint object or array");
+                        std::process::exit(2);
+                    };
+                for cp in checkpoints_arr {
+                    let seq = match cp
+                        .get("sequence")
+                        .and_then(|s| s.as_u64())
+                        .or_else(|| cp.get("seq").and_then(|s| s.as_u64()))
+                    {
+                        Some(s) => s,
+                        None => {
+                            eprintln!("Error: checkpoint missing sequence");
+                            std::process::exit(2);
+                        }
+                    };
+                    let hash = match cp
+                        .get("head_hash")
+                        .and_then(|h| h.as_str())
+                        .or_else(|| cp.get("event_hash").and_then(|h| h.as_str()))
+                    {
+                        Some(h) => h.to_string(),
+                        None => {
+                            eprintln!("Error: checkpoint missing head_hash");
+                            std::process::exit(2);
+                        }
+                    };
+                    file_anchors.push(ChainAnchor {
+                        sequence: seq,
+                        event_hash: hash,
+                    });
                 }
             }
             "--anchor" => {
@@ -298,6 +365,7 @@ fn main() {
     // `verifying_key` is set.
     let policy = VerificationPolicy {
         anchor: anchor.clone(),
+        anchors: file_anchors,
         verifying_key: None,
         legacy_timestamps_before,
     };

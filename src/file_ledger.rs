@@ -36,6 +36,7 @@ pub struct FileLedger {
     signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     ledger_id: Arc<str>,
     lock: Arc<Mutex<()>>,
+    index: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
 impl FileLedger {
@@ -94,6 +95,7 @@ impl FileLedger {
             signing_key: signing_key.map(Arc::new),
             ledger_id: ledger_id.into(),
             lock: Arc::new(Mutex::new(())),
+            index: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -200,6 +202,150 @@ impl FileLedger {
 
     #[cfg(not(unix))]
     fn flock_un(_file: &File) {}
+
+    /// Append multiple events in a single group commit: O(payloads) digests computed outside lock,
+    /// single fsync/sync_data call for the entire batch.
+    pub fn append_batch(
+        &self,
+        events: &[(&str, &str, &str)],
+    ) -> Result<Vec<AuditEvent>, LedgerError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        for &(event_type, actor, payload) in events {
+            if payload.len() > MAX_PAYLOAD_BYTES {
+                let detail = format!("payload exceeds {MAX_PAYLOAD_BYTES} bytes");
+                return Err(LedgerError::InvalidInput(detail));
+            }
+            validate_identifiers(event_type, actor)?;
+            validate_canonical_payload(payload)?;
+        }
+
+        // Precompute all payload digests outside lock: O(payload) work before locking
+        let digests: Vec<String> = events
+            .iter()
+            .map(|&(_, _, payload)| crate::compute_payload_digest(payload))
+            .collect();
+
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
+            .ok_or_else(|| LedgerError::InvalidTimestamp("clock outside 1970-2554".into()))?;
+
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+
+        let mut file = opts.open(&self.path).map_err(|e| {
+            LedgerError::LockError(format!("cannot open ledger file for writing: {e}"))
+        })?;
+
+        Self::flock_ex(&file)?;
+
+        let append_res = (|| -> Result<Vec<AuditEvent>, LedgerError> {
+            let (mut cur_seq, mut cur_prev_hash, mut last_ts) = match Self::tail_record(&mut file)?
+            {
+                None => (1u64, GENESIS_PREV_HASH.to_string(), None),
+                Some(last_line) => {
+                    let last_ev = AuditEvent::from_json_line(&last_line)?;
+                    (
+                        last_ev.sequence + 1,
+                        last_ev.event_hash,
+                        crate::parse_timestamp_nanos(&last_ev.timestamp),
+                    )
+                }
+            };
+
+            let mut end_pos = file
+                .seek(SeekFrom::End(0))
+                .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))?;
+
+            let mut bytes_to_write = Vec::new();
+            if end_pos > 0 {
+                file.seek(SeekFrom::Start(end_pos - 1))
+                    .map_err(|e| LedgerError::LockError(format!("seek last byte failed: {e}")))?;
+                let mut last_byte = [0u8; 1];
+                file.read_exact(&mut last_byte)
+                    .map_err(|e| LedgerError::LockError(format!("read last byte failed: {e}")))?;
+                if last_byte[0] != b'\n' {
+                    bytes_to_write.push(b'\n');
+                    end_pos += 1;
+                }
+                file.seek(SeekFrom::End(0))
+                    .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))?;
+            }
+
+            let mut committed = Vec::with_capacity(events.len());
+            let mut index_entries = Vec::with_capacity(events.len());
+            let mut running_offset = end_pos;
+
+            for (i, &(event_type, actor, payload)) in events.iter().enumerate() {
+                let sequence = cur_seq;
+                let timestamp = last_ts
+                    .map_or(now_ns, |lts| now_ns.max(lts.saturating_add(1)))
+                    .to_string();
+                last_ts = crate::parse_timestamp_nanos(&timestamp);
+
+                let event_id = format!("ev_{}_{}", self.ledger_id, sequence);
+                let event_hash = crate::compute_event_hash_from_digest(
+                    sequence,
+                    &event_id,
+                    &timestamp,
+                    event_type,
+                    actor,
+                    &cur_prev_hash,
+                    &digests[i],
+                );
+
+                let signature = self
+                    .signing_key
+                    .as_deref()
+                    .map(|key| sign_event_hash(key, &event_hash));
+
+                let event = AuditEvent {
+                    sequence,
+                    event_id,
+                    timestamp,
+                    event_type: event_type.to_string(),
+                    actor: actor.to_string(),
+                    payload: payload.to_string(),
+                    prev_hash: cur_prev_hash.clone(),
+                    event_hash: event_hash.clone(),
+                    signature,
+                    hash_version: HASH_VERSION,
+                };
+
+                let line = event.to_json_line();
+                index_entries.push((sequence, running_offset));
+                running_offset += line.len() as u64 + 1; // +1 for newline
+
+                bytes_to_write.extend_from_slice(line.as_bytes());
+                bytes_to_write.push(b'\n');
+
+                cur_prev_hash = event_hash;
+                cur_seq += 1;
+                committed.push(event);
+            }
+
+            file.write_all(&bytes_to_write)
+                .map_err(|e| LedgerError::LockError(format!("write_all failed: {e}")))?;
+
+            file.sync_data()
+                .map_err(|e| LedgerError::LockError(format!("sync_data failed: {e}")))?;
+
+            let mut idx = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            idx.extend(index_entries);
+
+            Ok(committed)
+        })();
+
+        Self::flock_un(&file);
+        append_res
+    }
 }
 
 impl AuditLedgerWriter for FileLedger {
@@ -315,6 +461,9 @@ impl AuditLedgerWriter for FileLedger {
             file.sync_data()
                 .map_err(|e| LedgerError::LockError(format!("sync_data failed: {e}")))?;
 
+            let mut idx = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            idx.push((sequence, end_pos));
+
             Ok(event)
         })();
 
@@ -325,8 +474,52 @@ impl AuditLedgerWriter for FileLedger {
 
 impl AuditLedgerReader for FileLedger {
     fn get_event(&self, sequence: u64) -> Result<Option<AuditEvent>, LedgerError> {
-        let events = self.all_events()?;
-        Ok(events.into_iter().find(|e| e.sequence == sequence))
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        if !self.path.exists() {
+            return Ok(None);
+        }
+
+        let mut file = File::open(&self.path).map_err(|e| {
+            LedgerError::LockError(format!("cannot open ledger for get_event: {e}"))
+        })?;
+
+        Self::flock_sh(&file)?;
+
+        let res = (|| -> Result<Option<AuditEvent>, LedgerError> {
+            let idx = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            let seek_offset = match idx.binary_search_by_key(&sequence, |&(s, _)| s) {
+                Ok(pos) => idx[pos].1,
+                Err(pos) if pos > 0 => idx[pos - 1].1,
+                _ => 0,
+            };
+            drop(idx);
+
+            file.seek(SeekFrom::Start(seek_offset))
+                .map_err(|e| LedgerError::LockError(format!("seek failed: {e}")))?;
+
+            let reader = BufReader::new(file);
+            for line_res in reader.lines() {
+                let line = line_res
+                    .map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let event = AuditEvent::from_json_line(trimmed)?;
+                if event.sequence == sequence {
+                    return Ok(Some(event));
+                }
+                if event.sequence > sequence {
+                    return Ok(None);
+                }
+            }
+            Ok(None)
+        })();
+
+        // unlock advisory flock
+        // file is consumed by BufReader so flock is released when descriptor drops
+        res
     }
 
     fn head(&self) -> Result<Option<AuditEvent>, LedgerError> {

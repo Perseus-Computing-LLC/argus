@@ -879,6 +879,7 @@ fn rv_f3_file_ledger_verifies_50k_records_streaming_and_finds_a_fault_at_the_tai
         anchor: Some(anchor),
         verifying_key: None,
         legacy_timestamps_before: None,
+        ..Default::default()
     };
     assert!(ledger.verify_chain_with(&policy).unwrap().valid);
 
@@ -1089,4 +1090,51 @@ fn issue14_legacy_timestamps_before_accepts_historic_regressions_only_below_the_
         report.failure,
         Some(LedgerError::InvalidTimestamp(_))
     ));
+}
+
+#[test]
+fn gd_append_batch_and_sparse_index_and_canonical_bytes() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("argus_gd_test_{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("audit.jsonl");
+
+    let ledger = FileLedger::new(&path).unwrap();
+
+    // 1. append_batch
+    let batch = vec![
+        ("batch.ev1", "actor1", "{\"num\":1}"),
+        ("batch.ev2", "actor2", "{\"num\":2}"),
+        ("batch.ev3", "actor3", "{\"num\":3}"),
+    ];
+    let appended = ledger
+        .append_batch(&batch)
+        .expect("append_batch should succeed");
+    assert_eq!(appended.len(), 3);
+    assert_eq!(appended[0].sequence, 1);
+    assert_eq!(appended[1].sequence, 2);
+    assert_eq!(appended[2].sequence, 3);
+    assert_eq!(appended[1].prev_hash, appended[0].event_hash);
+    assert_eq!(appended[2].prev_hash, appended[1].event_hash);
+
+    // 2. get_event via sparse index
+    let ev2 = ledger
+        .get_event(2)
+        .expect("get_event(2) should succeed")
+        .expect("ev2 should exist");
+    assert_eq!(ev2.sequence, 2);
+    assert_eq!(ev2.event_type, "batch.ev2");
+    assert_eq!(ev2.actor, "actor2");
+
+    // 3. canonical bytes: large integer in payload not mangled by float conversion
+    let raw_line = r#"{"sequence":4,"event_id":"00000000-0000-0000-0000-000000000004","timestamp":"2026-10-28T00:00:00Z","event_type":"type","actor":"actor","payload":{"large_int":123456789012345678901234567890},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","event_hash":"dummy","hash_version":2}"#;
+    let parsed = AuditEvent::from_json_line(raw_line).expect("from_json_line should succeed");
+    assert!(
+        parsed.payload.contains("123456789012345678901234567890"),
+        "canonical payload preserved without float rounding: {}",
+        parsed.payload
+    );
 }

@@ -200,3 +200,96 @@ fn anchor_mismatch_and_missing_file_use_distinct_exit_codes() {
     assert_eq!(code, 2);
     assert_eq!(json["valid"], false);
 }
+
+/// G-R1: Tracekit tail-cut reproduction and --anchor-file verification.
+/// Without an anchor, a truncated chain (events 8..10 deleted) passes internal verification.
+/// With an --anchor-file witnessing sequence 10, the tail-cut fails closed (exit 1).
+#[test]
+fn tracekit_tail_cut_detected_by_anchor_file() {
+    let path = scratch("tracekit_tail_cut");
+    let ledger = FileLedger::new(&path).unwrap();
+    let mut head_hashes = Vec::new();
+    for i in 1..=10 {
+        let ev = ledger
+            .append("task.event", "worker", &format!("{{\"step\":{i}}}"))
+            .unwrap();
+        head_hashes.push((ev.sequence, ev.event_hash.clone(), ev.timestamp.clone()));
+    }
+    let (seq10, hash10, ts10) = &head_hashes[9];
+    assert_eq!(*seq10, 10);
+
+    // Create an anchor checkpoint file witnessing sequence 10.
+    let anchor_file = path.with_file_name("checkpoints.json");
+    let checkpoint = serde_json::json!({
+        "checkpoints": [
+            {
+                "sequence": seq10,
+                "head_hash": hash10,
+                "timestamp": ts10
+            }
+        ]
+    });
+    std::fs::write(&anchor_file, checkpoint.to_string()).unwrap();
+
+    // 1. Intact ledger with anchor file passes.
+    let (code, json, stderr) = run(&[
+        "--json",
+        "--anchor-file",
+        anchor_file.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "intact ledger must pass: {json} {stderr}");
+    assert_eq!(json["valid"], true);
+    assert_eq!(json["total_events"], 10);
+
+    // 2. Tracekit attack: cut off the tail (keep only first 7 lines).
+    let content = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let truncated_path = path.with_file_name("audit_truncated.jsonl");
+    std::fs::write(&truncated_path, lines[..7].join("\n") + "\n").unwrap();
+
+    // Tracekit property: WITHOUT anchor, truncated log passes internal checks.
+    let (code_no_anchor, json_no_anchor, _) = run(&["--json", truncated_path.to_str().unwrap()]);
+    assert_eq!(
+        code_no_anchor, 0,
+        "truncated chain internally valid without anchor"
+    );
+    assert_eq!(json_no_anchor["valid"], true);
+    assert_eq!(json_no_anchor["total_events"], 7);
+
+    // G-R1 fix: WITH anchor file, the tail-cut attack is detected and fails closed (exit 1).
+    let (code_anchored, json_anchored, stderr_anchored) = run(&[
+        "--json",
+        "--anchor-file",
+        anchor_file.to_str().unwrap(),
+        truncated_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code_anchored, 1,
+        "tail-cut must fail verification: {json_anchored} {stderr_anchored}"
+    );
+    assert_eq!(json_anchored["valid"], false);
+    assert_eq!(json_anchored["first_broken_sequence"], 10);
+
+    // 3. Forged head at sequence 10 (key-holder re-sign / fork attack).
+    let bogus_anchor = path.with_file_name("bogus_checkpoints.json");
+    let bogus_checkpoint = serde_json::json!({
+        "checkpoints": [
+            {
+                "sequence": 10,
+                "head_hash": "0".repeat(64),
+                "timestamp": ts10
+            }
+        ]
+    });
+    std::fs::write(&bogus_anchor, bogus_checkpoint.to_string()).unwrap();
+    let (code_bogus, json_bogus, _) = run(&[
+        "--json",
+        "--anchor-file",
+        bogus_anchor.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(code_bogus, 1, "forged hash must fail: {json_bogus}");
+    assert_eq!(json_bogus["valid"], false);
+    assert_eq!(json_bogus["first_broken_sequence"], 10);
+}
