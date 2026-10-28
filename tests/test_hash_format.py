@@ -116,10 +116,12 @@ class TestHashFormat(unittest.TestCase):
 
     def test_reattributing_a_record_is_detected_even_when_relabelled_as_format_1(self):
         ledger = AppendOnlyLedger(self.path, signing_key=KEY)
-        ledger.append("policy.override:svc-ci", "alice", {"rule": "prod-freeze"})
+        # The writer applies the Rust identifier grammar now, so the boundary shift uses a
+        # dot: "policy.override.svc-ci"/"alice" versus "policy.override"/"svc-ci.alice".
+        ledger.append("policy.override.svc-ci", "alice", {"rule": "prod-freeze"})
         for relabel in (False, True):
             records = _records(self.path)
-            records[0]["event_type"], records[0]["actor"] = "policy.override", "svc-ci:alice"
+            records[0]["event_type"], records[0]["actor"] = "policy.override", "svc-ci.alice"
             if relabel:
                 records[0]["hash_version"] = 1
             _write(self.path, records)

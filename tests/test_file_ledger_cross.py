@@ -140,13 +140,13 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
             # bypass the alpha.7 guard the way a pre-alpha.7 writer would have: write the record directly
             from argus_ledger import canonical  # noqa: F401
             import argus_ledger.ledger as L
-            saved = L.reject_float_payload
-            L.reject_float_payload = lambda *_a, **_k: None
+            saved = L.validate_payload
+            L.validate_payload = lambda *_a, **_k: None
             try:
                 ledger.append("tool_execution", "hermes_agent", {"tool": "kibisis_recall", "top_score": -9.865914147294541})
                 ledger.append("tool_execution", "hermes_agent", {"ratio": 0.1 + 0.2, "half": 0.5, "neg": -1234.5678})
             finally:
-                L.reject_float_payload = saved
+                L.validate_payload = saved
             self.assertTrue(ledger.verify_chain().valid)
             run = subprocess.run([binary, "--json", path], capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
