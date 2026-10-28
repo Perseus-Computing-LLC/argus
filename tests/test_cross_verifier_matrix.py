@@ -22,6 +22,15 @@ REPO = Path(__file__).resolve().parents[1]
 MAX_SAFE_INT = 2**53 - 1
 
 
+def _skip_or_fail(test, reason):
+    """Skip on a developer machine without the Rust artifacts; fail in CI, where the workflow
+    builds the crate first and a skip would hide a cross-language regression."""
+    if os.environ.get("CI", "").lower() in ("1", "true"):
+        test.fail(f"{reason} (CI must build the Rust crate before pytest)")
+    test.skipTest(reason)
+
+
+
 def _rustc():
     rustc = os.environ.get("RUSTC") or shutil.which("rustc")
     if not rustc and os.path.isfile("/opt/data/home/.cargo/bin/rustc"):
@@ -217,7 +226,7 @@ class CrossVerifierMatrixTest(unittest.TestCase):
         verifiers = list(self._verifiers())
         writers = list(self._ledgers())
         if len(verifiers) < 3 or len(writers) < 2:
-            self.skipTest("Rust toolchain, libargus_ledger.rlib or argus-verify binary missing")
+            _skip_or_fail(self, "Rust toolchain, libargus_ledger.rlib or argus-verify binary missing")
         cells = 0
         for writer_name, write in writers:
             for case_name, (mutate, expected) in _cases().items():

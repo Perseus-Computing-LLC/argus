@@ -377,10 +377,9 @@ impl AuditLedgerReader for FileLedger {
             events.push(event);
         }
 
-        if let Ok(file_ref) = File::open(&self.path) {
-            Self::flock_un(&file_ref);
-        }
-
+        // The shared lock belongs to `file`, which the `lines()` iterator owns; it is released
+        // when that iterator drops at the end of the loop. Unlocking a freshly opened descriptor
+        // would not touch it.
         Ok(events)
     }
 }

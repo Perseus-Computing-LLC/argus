@@ -12,6 +12,14 @@ from argus_ledger.hasher import compute_event_hash, compute_payload_digest
 from argus_ledger.models import GENESIS_PREV_HASH
 
 
+def _skip_or_fail(test, reason):
+    """Skip on a developer machine without the Rust artifacts; fail in CI, where the workflow
+    builds the crate first and a skip would hide a cross-language regression."""
+    if os.environ.get("CI", "").lower() in ("1", "true"):
+        test.fail(f"{reason} (CI must build the Rust crate before pytest)")
+    test.skipTest(reason)
+
+
 def _argus_verify_binary() -> str | None:
     for candidate in (Path(__file__).resolve().parents[1] / "target" / "release" / "argus-verify",
                       Path(__file__).resolve().parents[1] / "target" / "debug" / "argus-verify"):
@@ -68,7 +76,7 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
     def test_python_writes_rust_verifies(self):
         tools = _find_rust_tools()
         if tools is None:
-            self.skipTest("rustc or compiled libargus_ledger.rlib not available")
+            _skip_or_fail(self, "rustc or compiled libargus_ledger.rlib not available")
         rustc, rlib, deps_dir = tools
 
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
@@ -132,7 +140,7 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
         """Ledgers written before alpha.7 hold floats; the Rust verifier (float_roundtrip) must still verify them."""
         binary = _argus_verify_binary()
         if not binary:
-            self.skipTest("argus-verify binary not built")
+            _skip_or_fail(self, "argus-verify binary not built")
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
         try:
@@ -158,7 +166,7 @@ class TestFileLedgerCrossCompat(unittest.TestCase):
     def test_rust_writes_python_verifies(self):
         tools = _find_rust_tools()
         if tools is None:
-            self.skipTest("rustc or compiled libargus_ledger.rlib not available")
+            _skip_or_fail(self, "rustc or compiled libargus_ledger.rlib not available")
         rustc, rlib, deps_dir = tools
 
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
