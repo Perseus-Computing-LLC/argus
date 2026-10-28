@@ -20,8 +20,16 @@ itself was intact: this was a verifier defect, not tampering, but it meant the r
 could not independently confirm a ledger the Python library had written.
 
 ### Fixed
-- `argus-verify` builds `serde_json` with `float_roundtrip`, so historical float payloads
-  (any ledger written before this release) verify again. Kept permanently: the ledger is append-only.
+- `argus-verify` builds `serde_json` with `float_roundtrip`, so float payloads whose shortest
+  round-trip repr has 16-17 significant digits (such as `-9.865914147294541` above) parse exactly
+  and verify again. Kept permanently: the ledger is append-only.
+- **Not fixed by this (corrected 2026-10-28):** `float_roundtrip` changes parsing, not formatting.
+  A float that Python printed in exponent notation (`1e-05`, `1e-07`, anything with |x| < 1e-4)
+  is re-serialized by serde_json as `1e-5`/`1e-7`, the payload digest differs, and the Rust side
+  (`argus-verify` and `FileLedger::verify_chain`) still reports `Event hash mismatch` for that
+  record while the Python `verify_chain()` passes. Pre-alpha.7 ledgers holding such values cannot
+  be verified by the Rust side; use the Python verifier for them. Values such as `0.5`,
+  `0.30000000000000004`, `1e+16` and `-0.0` are unaffected.
 
 ### Changed
 - **The Python writer now refuses floats** (`FloatPayloadError` from `AppendOnlyLedger.append`), matching the
