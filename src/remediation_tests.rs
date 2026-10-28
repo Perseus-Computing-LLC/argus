@@ -834,6 +834,83 @@ fn rv_f17_legacy_format_1_records_verify_and_cannot_be_relabelled() {
     }
 }
 
+/// F3: a long ledger verifies in one pass from disk, and a fault at the end is still found at
+/// the right position. Correctness over a 50k-record file; memory is checked by inspection
+/// (`verify_chain_with` never builds a `Vec<AuditEvent>`).
+#[test]
+fn rv_f3_file_ledger_verifies_50k_records_streaming_and_finds_a_fault_at_the_tail() {
+    let dir = tempfile_dir("rv_f3");
+    let path = dir.join("audit.jsonl");
+    const N: u64 = 50_000;
+    // Build the chain in memory (FileLedger::append syncs every record, which is the point of
+    // the writer but far too slow for 50k test records) and write it as one file.
+    let source = InMemoryLedger::new();
+    let mut content = String::new();
+    for i in 0..N {
+        let ev = source
+            .append("tool.exec", "agent", &format!("{{\"i\":{i}}}"))
+            .unwrap();
+        content.push_str(&ev.to_json_line());
+        content.push('\n');
+    }
+    std::fs::write(&path, &content).unwrap();
+    let ledger = FileLedger::new(&path).unwrap();
+    let report = ledger.verify_chain().unwrap();
+    assert!(report.valid, "{:?}", report.error_detail);
+    assert_eq!(report.total_events, N as usize);
+    assert_eq!(report.head_hash, ledger.head().unwrap().unwrap().event_hash);
+
+    let anchor = ChainAnchor {
+        sequence: N,
+        event_hash: report.head_hash.clone(),
+    };
+    let policy = VerificationPolicy {
+        anchor: Some(anchor),
+        verifying_key: None,
+    };
+    assert!(ledger.verify_chain_with(&policy).unwrap().valid);
+
+    // Flip one payload byte in the last record: found at position N with the right counts.
+    let last_payload = format!("\"i\":{}", N - 1);
+    let pos = content.rfind(&last_payload).unwrap();
+    content.replace_range(pos..pos + last_payload.len(), &format!("\"i\":{N}"));
+    std::fs::write(&path, &content).unwrap();
+    let report = ledger.verify_chain().unwrap();
+    assert!(!report.valid);
+    assert_eq!(report.first_broken_sequence, Some(N));
+    assert_eq!(report.total_events, N as usize);
+    assert!(matches!(report.failure, Some(LedgerError::HashMismatch(_))));
+
+    // Truncate the tail: the anchor is no longer witnessed.
+    let keep = content.rfind('\n').unwrap();
+    std::fs::write(&path, &content[..keep]).unwrap();
+    let report = ledger.verify_chain_with(&policy).unwrap();
+    assert!(!report.valid);
+    assert_eq!(report.first_broken_sequence, Some(N));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A line that is not a record fails the library verifier at its position, with the same
+/// report shape the Python package produces.
+#[test]
+fn rv_f2_file_ledger_verify_fails_closed_on_a_malformed_line() {
+    let dir = tempfile_dir("rv_f2");
+    let path = dir.join("audit.jsonl");
+    let ledger = FileLedger::new(&path).unwrap();
+    ledger.append("a.b", "x", "{}").unwrap();
+    let ev2 = ledger.append("a.b", "x", "{}").unwrap();
+    let mut content = std::fs::read_to_string(&path).unwrap();
+    content.push_str("{\"sequence\":3,\"event_id\":\"torn\n");
+    std::fs::write(&path, content).unwrap();
+    let report = ledger.verify_chain().unwrap();
+    assert!(!report.valid);
+    assert_eq!(report.first_broken_sequence, Some(3));
+    assert_eq!(report.total_events, 3);
+    assert!(matches!(report.failure, Some(LedgerError::InvalidInput(_))));
+    assert_eq!(report.head_hash, ev2.event_hash);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn tempfile_dir(prefix: &str) -> std::path::PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()

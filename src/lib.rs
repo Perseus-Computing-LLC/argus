@@ -844,116 +844,176 @@ impl AuditVerifier for InMemoryLedger {
 }
 
 impl VerificationPolicy {
-    /// Verify an exported or persisted event sequence, such as the output of `all_events()`.
+    /// Verify an exported or in-memory event sequence, such as the output of `all_events()`.
     /// Without `self.anchor` this proves internal consistency only.
     pub fn verify<E: Borrow<AuditEvent>>(
         &self,
         events: &[E],
     ) -> Result<ChainVerificationReport, LedgerError> {
-        let events: Vec<&AuditEvent> = events.iter().map(Borrow::<AuditEvent>::borrow).collect();
+        self.verify_stream(events.iter().map(|e| Ok(e.borrow().clone())))
+    }
+
+    /// Verify records as they are produced, holding one record at a time, so a file of any
+    /// length costs constant memory. An `Err` item is a record that could not be parsed: it
+    /// fails the chain at the position it would have occupied (fail closed), which is how the
+    /// Python package and the `argus-verify` CLI treat a torn or vandalised line.
+    ///
+    /// On failure `total_events` is the number of records examined up to and including the
+    /// broken one and `head_hash` is the last record that verified; the rest of the input is
+    /// not consumed.
+    pub fn verify_stream<I>(&self, records: I) -> Result<ChainVerificationReport, LedgerError>
+    where
+        I: IntoIterator<Item = Result<AuditEvent, LedgerError>>,
+    {
+        let mut verifier = ChainVerifier::new(self);
+        for record in records {
+            match record {
+                Ok(event) => {
+                    if let Some(report) = verifier.push(&event) {
+                        return Ok(report);
+                    }
+                }
+                Err(error) => return Ok(verifier.fail_next(error)),
+            }
+        }
+        Ok(verifier.finish())
+    }
+}
+
+/// Incremental chain verifier behind [`VerificationPolicy::verify_stream`]: feed records in file
+/// order with [`ChainVerifier::push`], then call [`ChainVerifier::finish`]. Only the running
+/// state (expected link, last instant, counters) is kept between records.
+pub struct ChainVerifier<'a> {
+    policy: &'a VerificationPolicy,
+    position: u64,
+    expected_prev: String,
+    prev_timestamp: Option<u64>,
+    legacy_events: usize,
+    root_hash: String,
+    head_hash: String,
+    anchor_matched: bool,
+    checked_at: String,
+}
+
+impl<'a> ChainVerifier<'a> {
+    pub fn new(policy: &'a VerificationPolicy) -> Self {
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let checked_at = format!("{}", now_sec);
-
-        if events.is_empty() && self.anchor.is_none() {
-            return Ok(ChainVerificationReport {
-                valid: true,
-                total_events: 0,
-                root_hash: String::new(),
-                head_hash: String::new(),
-                first_broken_sequence: None,
-                error_detail: None,
-                failure: None,
-                checked_at,
-                legacy_events: 0,
-            });
+        Self {
+            policy,
+            position: 0,
+            expected_prev: GENESIS_PREV_HASH.to_string(),
+            prev_timestamp: None,
+            legacy_events: 0,
+            root_hash: String::new(),
+            head_hash: String::new(),
+            anchor_matched: false,
+            checked_at: format!("{now_sec}"),
         }
+    }
 
-        let root_hash = events
-            .first()
-            .map(|e| e.event_hash.clone())
-            .unwrap_or_default();
-        let head_hash = events
-            .last()
-            .map(|e| e.event_hash.clone())
-            .unwrap_or_default();
-        // `position` is computed by the verifier, never read from the record under test.
-        let fail = |position: u64, error: LedgerError, legacy_events: usize| {
-            ChainVerificationReport {
-                valid: false,
-                total_events: events.len(),
-                root_hash: root_hash.clone(),
-                head_hash: head_hash.clone(),
-                first_broken_sequence: Some(position),
-                error_detail: Some(error.to_string()),
-                failure: Some(error),
-                checked_at: checked_at.clone(),
-                legacy_events,
-            }
+    /// Records examined so far.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// `position` is computed by the verifier, never read from the record under test.
+    fn report(&self, position: u64, error: LedgerError) -> ChainVerificationReport {
+        ChainVerificationReport {
+            valid: false,
+            total_events: self.position as usize,
+            root_hash: self.root_hash.clone(),
+            head_hash: self.head_hash.clone(),
+            first_broken_sequence: Some(position),
+            error_detail: Some(error.to_string()),
+            failure: Some(error),
+            checked_at: self.checked_at.clone(),
+            legacy_events: self.legacy_events,
+        }
+    }
+
+    /// Fail the chain at the position the next record would have occupied: for a line that
+    /// could not be parsed into a record at all.
+    pub fn fail_next(&mut self, error: LedgerError) -> ChainVerificationReport {
+        self.position += 1;
+        self.report(self.position, error)
+    }
+
+    /// Check one record against the running state. `Some(report)` means the chain is broken
+    /// here and no further record should be pushed.
+    pub fn push(&mut self, event: &AuditEvent) -> Option<ChainVerificationReport> {
+        self.position += 1;
+        let seq = self.position;
+        if event.sequence != seq {
+            let detail = format!("position {seq} records sequence {}", event.sequence);
+            return Some(self.report(seq, LedgerError::SequenceDiscontinuity(detail)));
+        }
+        if event.prev_hash != self.expected_prev {
+            let detail = format!("broken prev_hash link at sequence {seq}");
+            return Some(self.report(seq, LedgerError::HashMismatch(detail)));
+        }
+        // The record's own hash_version selects the preimage. Relabelling cannot make a
+        // record verify: its stored hash commits to exactly one format.
+        if !event_hash_matches(event) {
+            let detail = format!("tampered content hash at sequence {seq}");
+            return Some(self.report(seq, LedgerError::HashMismatch(detail)));
+        }
+        let Some(timestamp) = parse_canonical_u64(&event.timestamp)
+            .filter(|&ns| self.prev_timestamp.is_none_or(|prev| ns > prev))
+        else {
+            let detail = format!("timestamp at sequence {seq} is malformed or not increasing");
+            return Some(self.report(seq, LedgerError::InvalidTimestamp(detail)));
         };
-        let mut expected_prev: &str = GENESIS_PREV_HASH;
-        let mut prev_timestamp: Option<u64> = None;
-        let mut legacy_events = 0usize;
-        for (idx, event) in events.iter().enumerate() {
-            let seq = (idx as u64) + 1;
-            if event.sequence != seq {
-                let detail = format!("position {seq} records sequence {}", event.sequence);
-                return Ok(fail(seq, LedgerError::SequenceDiscontinuity(detail), legacy_events));
+        if let Some(key) = &self.policy.verifying_key {
+            let signed = event.signature.as_deref().is_some_and(|signature| {
+                verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
+            });
+            if !signed {
+                let detail = format!("missing or invalid signature at sequence {seq}");
+                return Some(self.report(seq, LedgerError::InvalidSignature(detail)));
             }
-            if event.prev_hash != expected_prev {
-                let detail = format!("broken prev_hash link at sequence {seq}");
-                return Ok(fail(seq, LedgerError::HashMismatch(detail), legacy_events));
-            }
-            // The record's own hash_version selects the preimage. Relabelling cannot make a
-            // record verify: its stored hash commits to exactly one format.
-            if !event_hash_matches(event) {
-                let detail = format!("tampered content hash at sequence {seq}");
-                return Ok(fail(seq, LedgerError::HashMismatch(detail), legacy_events));
-            }
-            legacy_events += usize::from(event.hash_version == 1);
-            let Some(timestamp) = parse_canonical_u64(&event.timestamp)
-                .filter(|&ns| prev_timestamp.is_none_or(|prev| ns > prev))
-            else {
-                let detail = format!("timestamp at sequence {seq} is malformed or not increasing");
-                return Ok(fail(seq, LedgerError::InvalidTimestamp(detail), legacy_events));
-            };
-            prev_timestamp = Some(timestamp);
-            if let Some(key) = &self.verifying_key {
-                let signed = event.signature.as_deref().is_some_and(|signature| {
-                    verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
-                });
-                if !signed {
-                    let detail = format!("missing or invalid signature at sequence {seq}");
-                    return Ok(fail(seq, LedgerError::InvalidSignature(detail), legacy_events));
+        }
+        if let Some(anchor) = &self.policy.anchor {
+            if anchor.sequence == seq {
+                if anchor.event_hash != event.event_hash {
+                    let detail = format!("chain does not contain anchored event {seq}");
+                    return Some(self.report(seq, LedgerError::HashMismatch(detail)));
                 }
+                self.anchor_matched = true;
             }
-            expected_prev = &event.event_hash;
         }
+        self.legacy_events += usize::from(event.hash_version == 1);
+        self.prev_timestamp = Some(timestamp);
+        if seq == 1 {
+            self.root_hash = event.event_hash.clone();
+        }
+        self.head_hash = event.event_hash.clone();
+        self.expected_prev = event.event_hash.clone();
+        None
+    }
 
-        if let Some(anchor) = &self.anchor {
-            let witnessed = usize::try_from(anchor.sequence)
-                .ok()
-                .and_then(|n| n.checked_sub(1))
-                .and_then(|i| events.get(i));
-            if witnessed.map(|e| &e.event_hash) != Some(&anchor.event_hash) {
+    /// End of input: the anchor, if any, must have been seen, otherwise the file was truncated
+    /// or rolled back below it.
+    pub fn finish(self) -> ChainVerificationReport {
+        if let Some(anchor) = &self.policy.anchor {
+            if !self.anchor_matched {
                 let detail = format!("chain does not contain anchored event {}", anchor.sequence);
-                return Ok(fail(anchor.sequence, LedgerError::HashMismatch(detail), legacy_events));
+                return self.report(anchor.sequence, LedgerError::HashMismatch(detail));
             }
         }
-
-        Ok(ChainVerificationReport {
+        ChainVerificationReport {
             valid: true,
-            total_events: events.len(),
-            root_hash,
-            head_hash,
+            total_events: self.position as usize,
+            root_hash: self.root_hash,
+            head_hash: self.head_hash,
             first_broken_sequence: None,
             error_detail: None,
             failure: None,
-            checked_at,
-            legacy_events,
-        })
+            checked_at: self.checked_at,
+            legacy_events: self.legacy_events,
+        }
     }
 }
 

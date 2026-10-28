@@ -384,11 +384,48 @@ impl AuditLedgerReader for FileLedger {
 }
 
 impl AuditVerifier for FileLedger {
+    /// One pass over the file, parsing and checking each line as it is read: a 50k-record
+    /// ledger does not become 50k resident `AuditEvent`s (F3). A line that does not parse
+    /// fails the chain at that position (F2).
     fn verify_chain_with(
         &self,
         policy: &VerificationPolicy,
     ) -> Result<ChainVerificationReport, LedgerError> {
-        let events = self.all_events()?;
-        policy.verify(&events)
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        if !self.path.exists() {
+            return policy.verify_stream(std::iter::empty());
+        }
+
+        let file = File::open(&self.path)
+            .map_err(|e| LedgerError::LockError(format!("cannot open ledger for verify: {e}")))?;
+        Self::flock_sh(&file)?;
+
+        let mut io_error = None;
+        let records = BufReader::new(&file)
+            .lines()
+            .enumerate()
+            .map_while(|(idx, line_res)| match line_res {
+                Ok(line) => Some(line),
+                Err(e) => {
+                    io_error = Some(LedgerError::LockError(format!(
+                        "read line {} failed: {e}",
+                        idx + 1
+                    )));
+                    None
+                }
+            })
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(idx, line)| {
+                AuditEvent::from_json_line(line.trim())
+                    .map_err(|e| LedgerError::InvalidInput(format!("malformed line {}: {e}", idx + 1)))
+            });
+        let report = policy.verify_stream(records);
+        Self::flock_un(&file);
+        match io_error {
+            Some(e) => Err(e),
+            None => report,
+        }
     }
 }
