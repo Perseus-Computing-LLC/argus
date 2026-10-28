@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Repair set from the 2026-10-28 review. Finding ids refer to that review. No version bump.
+## [0.1.0-alpha.8] - 2026-10-28
+
+Repair set from the 2026-10-28 review. Finding ids refer to that review. Verifiers written for alpha.7 and
+earlier accept this release's ledgers; the writer gates (F6/F7) and the strict timestamp rule (F5) are the
+behavioural changes to read before upgrading a host that appends to an existing ledger (see #14).
 
 ### Added
 - **#14:** accept-as-historic timestamp cutoff for ledgers written before the strictly-increasing

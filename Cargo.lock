@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "argus-ledger"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 dependencies = [
  "ed25519-dalek",
  "getrandom",
