@@ -1,16 +1,22 @@
-//! `argus-verify`: high-performance cryptographic audit verifier CLI for Argus ledgers.
+//! `argus-verify`: standalone verifier CLI for Argus ledgers.
 //!
-//! Verifies SHA-256 hash chains, sequence continuity, prev_hash links, and optional
-//! witness anchors across millions of events per second with zero external dependencies.
+//! The CLI is a thin front end over the library: every line is parsed by
+//! [`argus_ledger::AuditEvent::from_json_line`] and the chain is checked by
+//! [`argus_ledger::VerificationPolicy::verify`], so the CLI, `FileLedger::verify_chain` and the
+//! Python package apply one set of rules (hash formats 1 and 2, prev_hash links, sequence
+//! continuity, strictly increasing timestamps, anchors). It fails closed: a non-blank line that
+//! is not a complete record is an integrity failure at that file position.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use argus_ledger::{AuditEvent, ChainAnchor, ChainVerificationReport, VerificationPolicy};
+
 fn print_help() {
     println!(
-        r#"argus-verify {} - Fast cryptographic ledger verifier for Argus audit trails
+        r#"argus-verify {} - Cryptographic ledger verifier for Argus audit trails
 
 USAGE:
     argus-verify [OPTIONS] [LEDGER_FILE]
@@ -20,188 +26,155 @@ ARGS:
 
 OPTIONS:
     --anchor <SEQ>:<HASH>   Verify the chain witnesses a known sequence and event hash
-    --benchmark, -b         Run 5 iterations to measure wall-clock latency and throughput
+    --benchmark, -b         Run 5 iterations (open, parse and verify) and report the median
     --json                  Output results in structured machine-readable JSON
     --help, -h              Print this help text
     --version, -v           Print version information
 
 EXIT CODES:
     0    Chain is cryptographically valid and all invariants hold
-    1    Integrity violation (broken hash, link, sequence, or anchor)
+    1    Integrity violation (malformed record, broken hash, link, sequence, timestamp or anchor)
     2    Usage error or file not found
 "#,
         env!("CARGO_PKG_VERSION")
     );
 }
 
-struct ParsedLine {
-    sequence: u64,
-    event_id: String,
-    timestamp: String,
-    event_type: String,
-    actor: String,
-    prev_hash: String,
-    event_hash: String,
-    payload_json: String,
-    hash_version: Option<u64>,
+/// Why a ledger file could not be turned into a list of events.
+enum LoadError {
+    /// The file could not be read at all: a usage/environment problem, exit 2.
+    Io(String),
+    /// A non-blank line is not a complete record: an integrity failure at `position`, exit 1.
+    Malformed { position: u64, detail: String },
 }
 
-fn compute_v1(seq: u64, id: &str, ts: &str, et: &str, actor: &str, prev: &str, payload_json: &str) -> String {
-    let header = format!("{seq}:{id}:{ts}:{et}:{actor}:{prev}:");
-    let mut input = Vec::with_capacity(header.len() + payload_json.len());
-    input.extend_from_slice(header.as_bytes());
-    input.extend_from_slice(payload_json.as_bytes());
-    argus_ledger::sha256_hex(&input)
-}
-
-fn verify_parsed_events(
-    events: &[ParsedLine],
-    anchor: Option<(u64, &str)>,
-) -> Result<(usize, usize, String, String), (u64, String)> {
-    if events.is_empty() {
-        return Ok((0, 0, String::new(), String::new()));
-    }
-
-    let mut expected_prev = argus_ledger::GENESIS_PREV_HASH.to_string();
-    let mut v1_count = 0usize;
-    let mut v2_count = 0usize;
-    let root_hash = events[0].event_hash.clone();
-    let head_hash = events.last().unwrap().event_hash.clone();
-
-    for (idx, ev) in events.iter().enumerate() {
-        let expected_seq = (idx as u64) + 1;
-        if ev.sequence != expected_seq {
-            return Err((
-                ev.sequence,
-                format!("Sequence discontinuity: expected {expected_seq}, found {}", ev.sequence),
-            ));
-        }
-
-        if ev.prev_hash != expected_prev {
-            return Err((
-                ev.sequence,
-                format!(
-                    "Broken prev_hash link at seq {}: expected {expected_prev}, found {}",
-                    ev.sequence, ev.prev_hash
-                ),
-            ));
-        }
-
-        let computed = if ev.hash_version == Some(2) {
-            let digest = argus_ledger::compute_payload_digest(&ev.payload_json);
-            argus_ledger::compute_event_hash_from_digest(
-                ev.sequence,
-                &ev.event_id,
-                &ev.timestamp,
-                &ev.event_type,
-                &ev.actor,
-                &ev.prev_hash,
-                &digest,
-            )
-        } else {
-            compute_v1(
-                ev.sequence,
-                &ev.event_id,
-                &ev.timestamp,
-                &ev.event_type,
-                &ev.actor,
-                &ev.prev_hash,
-                &ev.payload_json,
-            )
-        };
-
-        if computed != ev.event_hash {
-            return Err((
-                ev.sequence,
-                format!(
-                    "Event hash mismatch at seq {}: computed {computed}, recorded {}",
-                    ev.sequence, ev.event_hash
-                ),
-            ));
-        }
-
-        if let Some((anchor_seq, anchor_hash)) = anchor {
-            if ev.sequence == anchor_seq && ev.event_hash != anchor_hash {
-                return Err((
-                    ev.sequence,
-                    format!(
-                        "Anchor verification failed at seq {anchor_seq}: expected hash {anchor_hash}, found {}",
-                        ev.event_hash
-                    ),
-                ));
-            }
-        }
-
-        if ev.hash_version == Some(2) {
-            v2_count += 1;
-        } else {
-            v1_count += 1;
-        }
-        expected_prev = ev.event_hash.clone();
-    }
-
-    if let Some((anchor_seq, _anchor_hash)) = anchor {
-        if anchor_seq > events.len() as u64 {
-            return Err((
-                anchor_seq,
-                format!(
-                    "Anchor sequence {anchor_seq} exceeds total events in ledger ({})",
-                    events.len()
-                ),
-            ));
-        }
-    }
-
-    Ok((v1_count, v2_count, root_hash, head_hash))
-}
-
-fn load_events<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<ParsedLine>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+/// Parse every non-blank line or fail. A verifier that skipped what it could not read would
+/// call a torn or vandalised tail "valid" while the library and Python verifiers reject it.
+/// `position` counts non-blank lines, so it is the chain position the record should occupy and
+/// never a value read from the record itself.
+fn load_events(path: &Path) -> Result<Vec<AuditEvent>, LoadError> {
+    let file = File::open(path).map_err(|e| LoadError::Io(format!("failed to read file: {e}")))?;
     let mut events = Vec::new();
-
-    for line_res in reader.lines() {
-        let line = line_res?;
+    let mut position = 0u64;
+    for (idx, line_res) in BufReader::new(file).lines().enumerate() {
+        let line = line_res
+            .map_err(|e| LoadError::Io(format!("read error at line {}: {e}", idx + 1)))?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            continue;
+            continue; // blank lines only; a malformed line is never skipped
         }
+        position += 1;
+        let event = AuditEvent::from_json_line(trimmed).map_err(|e| LoadError::Malformed {
+            position,
+            detail: format!("malformed record at line {}: {e}", idx + 1),
+        })?;
+        events.push(event);
+    }
+    Ok(events)
+}
 
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(obj) = val.as_object() {
-                let seq = match obj.get("sequence").and_then(|v| v.as_u64()) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let event_id = obj.get("event_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let timestamp = obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let event_type = obj.get("event_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let actor = obj.get("actor").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let prev_hash = obj.get("prev_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let event_hash = obj.get("event_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let hash_version = obj.get("hash_version").and_then(|v| v.as_u64());
+/// Round to two decimals for display; the value is informational.
+fn ms(d: std::time::Duration) -> f64 {
+    (d.as_secs_f64() * 1000.0 * 100.0).round() / 100.0
+}
 
-                let payload_json = match obj.get("payload") {
-                    Some(p) => serde_json::to_string(p).unwrap_or_else(|_| "{}".to_string()),
-                    None => "{}".to_string(),
-                };
+/// Record content (hashes, error text) is emitted through serde_json only: hand-built JSON let
+/// a crafted `prev_hash` inject `"valid":true` into the machine-readable output.
+fn emit_failure(json_mode: bool, position: u64, error: &str, elapsed: std::time::Duration) {
+    if json_mode {
+        let out = serde_json::json!({
+            "valid": false,
+            "first_broken_sequence": position,
+            "error": error,
+            "elapsed_ms": ms(elapsed),
+        });
+        println!("{out}");
+    } else {
+        eprintln!("Audit Ledger Integrity: FAILED");
+        eprintln!("  Broken at seq: {position}");
+        eprintln!("  Error detail:  {error}");
+        eprintln!("  Time to fail:  {:.2} ms", ms(elapsed));
+    }
+}
 
-                events.push(ParsedLine {
-                    sequence: seq,
-                    event_id,
-                    timestamp,
-                    event_type,
-                    actor,
-                    prev_hash,
-                    event_hash,
-                    payload_json,
-                    hash_version,
-                });
-            }
+fn emit_success(
+    json_mode: bool,
+    report: &ChainVerificationReport,
+    anchor: Option<&ChainAnchor>,
+    elapsed: std::time::Duration,
+) {
+    let total = report.total_events;
+    let v1 = report.legacy_events;
+    let v2 = total - v1;
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        (total as f64 / elapsed.as_secs_f64()).round()
+    } else {
+        0.0
+    };
+    if json_mode {
+        let out = serde_json::json!({
+            "valid": true,
+            "total_events": total,
+            "v1_legacy_events": v1,
+            "v2_events": v2,
+            "root_hash": report.root_hash,
+            "head_hash": report.head_hash,
+            "elapsed_ms": ms(elapsed),
+            "events_per_sec": rate,
+        });
+        println!("{out}");
+    } else {
+        println!("Audit Ledger Integrity: VALID");
+        println!("  Total events:  {total}");
+        println!("  Format v1:     {v1} (legacy pre-20261015)");
+        println!("  Format v2:     {v2} (active domain-separated)");
+        println!("  Root hash:     {}", report.root_hash);
+        println!("  Head hash:     {}", report.head_hash);
+        println!(
+            "  Elapsed:       {:.2} ms end to end, open+parse+verify ({rate:.0} events/sec)",
+            ms(elapsed)
+        );
+        if let Some(a) = anchor {
+            println!("  Anchor (seq {}): MATCHED ({})", a.sequence, a.event_hash);
         }
     }
+}
 
-    Ok(events)
+/// Why one pass did not end in a valid chain.
+enum Failure {
+    /// Integrity verdict: exit 1, reported at a chain position.
+    Integrity(u64, String),
+    /// The file could not be read: exit 2, no verdict.
+    Io(String),
+}
+
+/// One end-to-end pass: open, parse and verify.
+fn run_once(path: &Path, policy: &VerificationPolicy) -> Result<ChainVerificationReport, Failure> {
+    let events = match load_events(path) {
+        Ok(events) => events,
+        Err(LoadError::Malformed { position, detail }) => {
+            return Err(Failure::Integrity(position, detail))
+        }
+        Err(LoadError::Io(detail)) => return Err(Failure::Io(detail)),
+    };
+    match policy.verify(&events) {
+        Ok(report) if report.valid => Ok(report),
+        Ok(report) => Err(Failure::Integrity(
+            report.first_broken_sequence.unwrap_or(0),
+            report.error_detail.unwrap_or_else(|| "verification failed".into()),
+        )),
+        Err(e) => Err(Failure::Io(e.to_string())),
+    }
+}
+
+fn exit_io(json_mode: bool, detail: &str) -> ! {
+    if json_mode {
+        let out = serde_json::json!({ "valid": false, "error": detail });
+        println!("{out}");
+    } else {
+        eprintln!("Error: failed to read ledger: {detail}");
+    }
+    std::process::exit(2);
 }
 
 fn main() {
@@ -210,7 +183,7 @@ fn main() {
     let mut ledger_path: Option<PathBuf> = None;
     let mut json_mode = false;
     let mut benchmark_mode = false;
-    let mut anchor: Option<(u64, String)> = None;
+    let mut anchor: Option<ChainAnchor> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -240,14 +213,17 @@ fn main() {
                     eprintln!("Error: invalid anchor format. Expected <SEQ>:<HASH>");
                     std::process::exit(2);
                 }
-                let seq = match parts[0].parse::<u64>() {
+                let sequence = match parts[0].parse::<u64>() {
                     Ok(s) => s,
                     Err(_) => {
                         eprintln!("Error: anchor sequence must be an integer");
                         std::process::exit(2);
                     }
                 };
-                anchor = Some((seq, parts[1].to_string()));
+                anchor = Some(ChainAnchor {
+                    sequence,
+                    event_hash: parts[1].to_string(),
+                });
             }
             other => {
                 if other.starts_with('-') {
@@ -267,116 +243,85 @@ fn main() {
 
     if !path.exists() {
         if json_mode {
-            println!(
-                r#"{{"valid":false,"error":"file not found","path":"{}"}}"#,
-                path.display()
-            );
+            let out = serde_json::json!({
+                "valid": false,
+                "error": "file not found",
+                "path": path.display().to_string(),
+            });
+            println!("{out}");
         } else {
             eprintln!("Error: audit file not found: {}", path.display());
         }
         std::process::exit(2);
     }
 
-    let t_load = Instant::now();
-    let events = match load_events(&path) {
-        Ok(ev) => ev,
-        Err(e) => {
-            if json_mode {
-                println!(
-                    r#"{{"valid":false,"error":"failed to read file: {}"}}"#,
-                    e
-                );
-            } else {
-                eprintln!("Error: failed to read ledger: {e}");
-            }
-            std::process::exit(2);
-        }
+    // The CLI has no key input yet, so signatures are not checked here; the library does when
+    // `verifying_key` is set.
+    let policy = VerificationPolicy {
+        anchor: anchor.clone(),
+        verifying_key: None,
     };
-    let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
-
-    let anchor_ref = anchor.as_ref().map(|(seq, hash)| (*seq, hash.as_str()));
 
     if benchmark_mode {
+        // Each iteration is a complete open+parse+verify pass, which is what an operator pays
+        // for; a verify-only loop over pre-parsed events overstated throughput by 3-4x.
         let iterations = 5;
-        let mut times = Vec::new();
-        let mut last_res = None;
+        let mut times = Vec::with_capacity(iterations);
+        let mut last = None;
         for _ in 0..iterations {
             let t0 = Instant::now();
-            let res = verify_parsed_events(&events, anchor_ref);
-            let elapsed = t0.elapsed();
-            times.push(elapsed.as_secs_f64() * 1000.0);
-            last_res = Some(res);
+            let res = run_once(&path, &policy);
+            times.push(t0.elapsed());
+            last = Some(res);
         }
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let min_ms = times[0];
-        let p50_ms = times[times.len() / 2];
-        let max_ms = times[times.len() - 1];
-        let total_ev = events.len();
-        let ev_per_sec = (total_ev as f64) / (p50_ms / 1000.0);
-
+        times.sort();
+        let p50 = times[times.len() / 2];
+        let (total, valid) = match last.as_ref().unwrap() {
+            Ok(report) => (report.total_events, true),
+            Err(Failure::Integrity(..)) => (0, false),
+            Err(Failure::Io(detail)) => exit_io(json_mode, detail),
+        };
+        let ev_per_sec = if p50.as_secs_f64() > 0.0 {
+            (total as f64 / p50.as_secs_f64()).round()
+        } else {
+            0.0
+        };
         if json_mode {
-            println!(
-                r#"{{"benchmark":true,"iterations":{},"events":{},"p50_ms":{:.2},"min_ms":{:.2},"max_ms":{:.2},"events_per_sec":{:.0}}}"#,
-                iterations, total_ev, p50_ms, min_ms, max_ms, ev_per_sec
-            );
+            let out = serde_json::json!({
+                "benchmark": true,
+                "valid": valid,
+                "iterations": iterations,
+                "events": total,
+                "p50_ms": ms(p50),
+                "min_ms": ms(times[0]),
+                "max_ms": ms(times[times.len() - 1]),
+                "events_per_sec": ev_per_sec,
+                "measures": "open+parse+verify",
+            });
+            println!("{out}");
         } else {
             println!(
-                "Benchmark ({} iterations over {} events):\n  p50: {:.2} ms ({:.0} ev/s)\n  min: {:.2} ms\n  max: {:.2} ms",
-                iterations, total_ev, p50_ms, ev_per_sec, min_ms, max_ms
+                "Benchmark ({iterations} iterations, open+parse+verify, {total} events):\n  p50: {:.2} ms ({ev_per_sec:.0} ev/s)\n  min: {:.2} ms\n  max: {:.2} ms",
+                ms(p50),
+                ms(times[0]),
+                ms(times[times.len() - 1])
             );
         }
-
-        match last_res.unwrap() {
-            Ok(_) => std::process::exit(0),
-            Err(_) => std::process::exit(1),
-        }
+        std::process::exit(if valid { 0 } else { 1 });
     }
 
-    let t_verify = Instant::now();
-    let verify_res = verify_parsed_events(&events, anchor_ref);
-    let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
-    let total_ev = events.len();
-    let rate = if verify_ms > 0.0 {
-        (total_ev as f64) / (verify_ms / 1000.0)
-    } else {
-        0.0
-    };
-
-    match verify_res {
-        Ok((v1_count, v2_count, root_hash, head_hash)) => {
-            if json_mode {
-                println!(
-                    r#"{{"valid":true,"total_events":{},"v1_legacy_events":{},"v2_events":{},"root_hash":"{}","head_hash":"{}","elapsed_ms":{:.2},"load_ms":{:.2},"events_per_sec":{:.0}}}"#,
-                    total_ev, v1_count, v2_count, root_hash, head_hash, verify_ms, load_ms, rate
-                );
-            } else {
-                println!("Audit Ledger Integrity: VALID");
-                println!("  Total events:  {}", total_ev);
-                println!("  Format v1:     {} (legacy pre-20261015)", v1_count);
-                println!("  Format v2:     {} (active domain-separated)", v2_count);
-                println!("  Root hash:     {}", root_hash);
-                println!("  Head hash:     {}", head_hash);
-                println!("  Load time:     {:.2} ms", load_ms);
-                println!("  Verify time:   {:.2} ms ({:.0} events/sec)", verify_ms, rate);
-                if let Some((aseq, ahash)) = anchor {
-                    println!("  Anchor (seq {}): MATCHED ({})", aseq, ahash);
-                }
-            }
+    let t0 = Instant::now();
+    let result = run_once(&path, &policy);
+    let elapsed = t0.elapsed();
+    match result {
+        Ok(report) => {
+            emit_success(json_mode, &report, anchor.as_ref(), elapsed);
             std::process::exit(0);
         }
-        Err((failed_seq, error_msg)) => {
-            if json_mode {
-                println!(
-                    r#"{{"valid":false,"first_broken_sequence":{},"error":"{}","elapsed_ms":{:.2}}}"#,
-                    failed_seq, error_msg, verify_ms
-                );
-            } else {
-                eprintln!("Audit Ledger Integrity: FAILED");
-                eprintln!("  Broken at seq: {}", failed_seq);
-                eprintln!("  Error detail:  {}", error_msg);
-                eprintln!("  Time to fail:  {:.2} ms", verify_ms);
-            }
+        Err(Failure::Integrity(position, error)) => {
+            emit_failure(json_mode, position, &error, elapsed);
             std::process::exit(1);
         }
+        Err(Failure::Io(detail)) => exit_io(json_mode, &detail),
     }
 }

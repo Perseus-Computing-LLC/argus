@@ -736,6 +736,7 @@ fn rv_f1_json_line_bytes_and_field_order_are_unchanged() {
         prev_hash: GENESIS_PREV_HASH.into(),
         event_hash: "3a7cfe22bc8ca5b032bca7defaaa1ac22f05c9922dff2bd5032e820f1a927f9b".into(),
         signature: None,
+        hash_version: 2,
     };
     assert_eq!(
         ev.to_json_line(),
@@ -755,6 +756,82 @@ fn rv_f1_json_line_bytes_and_field_order_are_unchanged() {
     assert!(line.contains(",\"signature\":\"ed25519:00\",\"hash_version\":2}"));
     // The payload is spliced in verbatim: non-ASCII stays unescaped, as the Python writer does.
     assert!(line.contains("\"payload\":{\"k\":[1,{\"n\":null}],\"u\":\"\u{e9}\"},"));
+}
+
+/// A ledger that spans the format change (format-1 records, then format-2) must verify in the
+/// library exactly as it does in the Python package and the CLI, and relabelling a record's
+/// format must not make it verify.
+#[test]
+fn rv_f17_legacy_format_1_records_verify_and_cannot_be_relabelled() {
+    let v1 = |sequence: u64, prev_hash: &str, payload: &str| {
+        let mut ev = AuditEvent {
+            sequence,
+            event_id: format!("legacy-{sequence}"),
+            timestamp: format!("2026-10-0{sequence}T00:00:00+00:00"),
+            event_type: "tool.exec".into(),
+            actor: "agent".into(),
+            payload: payload.into(),
+            prev_hash: prev_hash.into(),
+            event_hash: String::new(),
+            signature: None,
+            hash_version: 1,
+        };
+        ev.event_hash = legacy_v1_event_hash(&ev);
+        ev
+    };
+    let e1 = v1(1, GENESIS_PREV_HASH, "{\"i\":1}");
+    let e2 = v1(2, &e1.event_hash, "{\"i\":2}");
+    let mut e3 = AuditEvent {
+        sequence: 3,
+        event_id: "ev_3".into(),
+        timestamp: "2026-10-03T00:00:00+00:00".into(),
+        event_type: "tool.exec".into(),
+        actor: "agent".into(),
+        payload: "{\"i\":3}".into(),
+        prev_hash: e2.event_hash.clone(),
+        event_hash: String::new(),
+        signature: None,
+        hash_version: 2,
+    };
+    e3.event_hash = compute_event_hash(
+        3,
+        &e3.event_id,
+        &e3.timestamp,
+        &e3.event_type,
+        &e3.actor,
+        &e3.prev_hash,
+        &e3.payload,
+    );
+    // Matches the Python reference `compute_event_hash(..., hash_version=1)`.
+    assert_eq!(
+        e1.event_hash,
+        sha256_hex(
+            format!(
+                "1:legacy-1:2026-10-01T00:00:00+00:00:tool.exec:agent:{GENESIS_PREV_HASH}:{{\"i\":1}}"
+            )
+            .as_bytes()
+        )
+    );
+
+    let report = VerificationPolicy::default()
+        .verify(&[e1.clone(), e2.clone(), e3.clone()])
+        .unwrap();
+    assert!(report.valid, "{:?}", report.error_detail);
+    assert_eq!((report.total_events, report.legacy_events), (3, 2));
+
+    // A record parsed from a line without hash_version is format 1 and round-trips as such.
+    let line = e1.to_json_line().replace(",\"hash_version\":1}", "}");
+    let parsed = AuditEvent::from_json_line(&line).unwrap();
+    assert_eq!(parsed, e1);
+    assert!(AuditEvent::from_json_line(&line.replace('}', ",\"hash_version\":3}")).is_err());
+
+    for (position, relabel) in [(1usize, 2u8), (2, 2), (3, 1)] {
+        let mut events = vec![e1.clone(), e2.clone(), e3.clone()];
+        events[position - 1].hash_version = relabel;
+        let report = VerificationPolicy::default().verify(&events).unwrap();
+        assert_eq!(report.first_broken_sequence, Some(position as u64));
+        assert!(matches!(report.failure, Some(LedgerError::HashMismatch(_))));
+    }
 }
 
 fn tempfile_dir(prefix: &str) -> std::path::PathBuf {

@@ -13,7 +13,7 @@ use crate::{
     hex_lower, sign_event_hash, validate_canonical_payload,
     validate_identifiers, AuditEvent, AuditLedgerReader, AuditLedgerWriter, AuditVerifier,
     ChainVerificationReport, LedgerError, VerificationPolicy, GENESIS_PREV_HASH,
-    MAX_PAYLOAD_BYTES,
+    HASH_VERSION, MAX_PAYLOAD_BYTES,
 };
 
 #[cfg(unix)]
@@ -281,6 +281,7 @@ impl AuditLedgerWriter for FileLedger {
                 prev_hash,
                 event_hash,
                 signature,
+                hash_version: HASH_VERSION,
             };
 
             let line = event.to_json_line();
