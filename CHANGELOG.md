@@ -7,7 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Repair set from the 2026-10-28 review. Finding ids refer to that review. No version bump.
+
+### Fixed
+- **F1 (critical):** Rust `AuditEvent::to_json_line` built the record line with `format!`, so an
+  actor containing `"` or `\` (both ASCII-graphic, so accepted by `validate_identifiers`) produced
+  a line no reader could parse, after which every append and every verifier failed on an honest
+  ledger. Every string field is now serialized through serde_json; the payload is spliced in
+  verbatim as a `RawValue` (it is already canonical JSON and the hash commits to those bytes).
+  Field order and `"signature":null` are unchanged, so existing records and the Python writer stay
+  byte-identical. `validate_identifiers` now also rejects `"` and `\` in `actor`.
+- **F2 (high):** `argus-verify` skipped any line it could not parse and reported a torn or
+  vandalised tail as a valid chain. Every non-blank line must now parse as a complete record, or
+  the verdict is FAILED at that file position (exit 1). The position is counted, never read from
+  the record.
+- **F3 (high):** `verify_chain` (Python) and `FileLedger::verify_chain` (Rust) read the whole
+  file into memory before checking the first record. Both now verify in one streaming pass with
+  one record resident; `VerificationPolicy::verify_stream` and `ChainVerifier` are the Rust
+  entry points and `argus-verify` uses them too.
+- **F5 (high):** one timestamp contract across all writers and verifiers: timestamps are
+  strictly increasing when compared as instants. Rust parses RFC 3339 with any UTC offset
+  (`+05:00`, `Z`, none) via `split_utc_offset`; `parse_timestamp_nanos` is public. The Python
+  writer takes `max(now, last + 1 µs)` under the append lock (production showed clock-step
+  regressions) and keeps its RFC 3339 `+00:00` format. Python `verify_chain` applies the same
+  strictly-increasing check as the Rust library and CLI. A cross-language matrix test runs
+  {Python, Rust} writer × {Python verify, Rust library, `argus-verify`} over equal timestamps,
+  offsets, torn tails, empty actors and 2^53-1 integers; every cell must agree.
+- **F17:** `AuditEvent` carries `hash_version` (absent parses as 1, as in Python); the Rust
+  verifier recomputes each record's hash in its own format, so legacy format-1 records verify
+  and a relabelled record cannot. `ChainVerificationReport.legacy_events` counts them.
+- **F8:** `argus-verify --json` output is built with serde_json; record content can no longer
+  inject keys into it.
+- **F16:** `FileLedger::all_events` no longer "unlocks" a different file descriptor.
+- **F4:** the 0.1.0-alpha.7 entry below no longer claims exponent-form floats verify in Rust.
+
 ### Changed
+- **F6/F7:** the Python writer applies the Rust identifier grammar (`validate_identifiers`:
+  same regex, 256-byte cap, raises `IdentifierError`) and refuses payload integers outside
+  ±(2^53-1) (`IntegerRangeError`), non-object payloads and canonical encodings over 1 MiB
+  (`PayloadError`). `reject_float_payload` is renamed `validate_payload`; the old name is kept as
+  an alias. `FloatPayloadError` now subclasses `PayloadError`.
+- **F15:** CI builds the Rust crate (debug and release) in the Python job before pytest; with
+  `CI=true` the cross-language tests fail instead of skipping when the artifacts are missing.
+- **F14:** README throughput figures are labelled in-memory / verify-phase-only.
+- **F11:** `argus_ledger.proofweave` is marked experimental (`RAGTriadBinding` emits floats the
+  ledger refuses).
+- `argus-verify --benchmark` measures open+parse+verify per iteration and says so.
+- Rust sources are `cargo fmt` formatted and clippy-clean, so the Rust CI job can pass.
+
+## [0.1.0-alpha.7] - 2026-10-27
+
+### Security / correctness note — float payloads and the Rust verifier (found 2026-10-27)
+On a production ledger of 32,908 events, `argus-verify 0.1.0-alpha.6` reported
+`Event hash mismatch at seq 30936` while the Python `verify_chain()` passed. The record's payload held
+`"top_score": -9.865914147294541`, written by the Python library (shortest round-trip repr, 16 digits).
+serde_json's default float parser is not correctly rounded; it read the value as `-9.86591414729454`,
+re-serialized it that way, and the payload digest changed. 41 of the 32,908 events carried floats
+(22 `tool_execution` from the Kibisis plugin's `top_score`, 19 `tci.self_improvement_cycle`). The chain
+itself was intact: this was a verifier defect, not tampering, but it meant the released Rust verifier
+could not independently confirm a ledger the Python library had written.
+
+### Fixed
+- `argus-verify` builds `serde_json` with `float_roundtrip`, so float payloads whose shortest
+  round-trip repr has 16-17 significant digits (such as `-9.865914147294541` above) parse exactly
+  and verify again. Kept permanently: the ledger is append-only.
+- **Not fixed by this (corrected 2026-10-28):** `float_roundtrip` changes parsing, not formatting.
+  A float that Python printed in exponent notation (`1e-05`, `1e-07`, anything with |x| < 1e-4)
+  is re-serialized by serde_json as `1e-5`/`1e-7`, the payload digest differs, and the Rust side
+  (`argus-verify` and `FileLedger::verify_chain`) still reports `Event hash mismatch` for that
+  record while the Python `verify_chain()` passes. Pre-alpha.7 ledgers holding such values cannot
+  be verified by the Rust side; use the Python verifier for them. Values such as `0.5`,
+  `0.30000000000000004`, `1e+16` and `-0.0` are unaffected.
+
+### Changed
+- **The Python writer now refuses floats** (`FloatPayloadError` from `AppendOnlyLedger.append`), matching the
+  Rust writer's `validate_canonical_payload`. Nothing is written when the check fails. Callers pass integers
+  (basis points, micro-units, milliseconds) or fixed-format strings (`f"{x:.6f}"`); the two writers then
+  produce byte-identical canonical JSON and neither side depends on IEEE-754 formatting (`1e-07` vs `1e-7`,
+  16- vs 17-digit shortest repr). `reject_float_payload()` is exported for callers that want to check early.
 - CI: every action is pinned to a full commit SHA (the Rust toolchain action followed a branch) and
   runs on Node 24. Dependabot proposes weekly grouped updates for actions, Cargo and Python
   dependencies once a release is 7 days old, and an OpenSSF Scorecard workflow reports to code

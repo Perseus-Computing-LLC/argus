@@ -10,10 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
-    hex_lower, sign_event_hash, validate_canonical_payload,
-    validate_identifiers, AuditEvent, AuditLedgerReader, AuditLedgerWriter, AuditVerifier,
-    ChainVerificationReport, LedgerError, VerificationPolicy, GENESIS_PREV_HASH,
-    MAX_PAYLOAD_BYTES,
+    hex_lower, sign_event_hash, validate_canonical_payload, validate_identifiers, AuditEvent,
+    AuditLedgerReader, AuditLedgerWriter, AuditVerifier, ChainVerificationReport, LedgerError,
+    VerificationPolicy, GENESIS_PREV_HASH, HASH_VERSION, MAX_PAYLOAD_BYTES,
 };
 
 #[cfg(unix)]
@@ -81,10 +80,7 @@ impl FileLedger {
             if let Ok(metadata) = file.metadata() {
                 let current_mode = metadata.permissions().mode() & 0o777;
                 if current_mode != 0o600 {
-                    let _ = std::fs::set_permissions(
-                        &path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
                 }
             }
         }
@@ -164,7 +160,9 @@ impl FileLedger {
         let ret = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(LedgerError::LockError(format!("flock LOCK_EX failed: {err}")));
+            return Err(LedgerError::LockError(format!(
+                "flock LOCK_EX failed: {err}"
+            )));
         }
         Ok(())
     }
@@ -175,7 +173,9 @@ impl FileLedger {
         let ret = unsafe { flock(file.as_raw_fd(), LOCK_SH) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(LedgerError::LockError(format!("flock LOCK_SH failed: {err}")));
+            return Err(LedgerError::LockError(format!(
+                "flock LOCK_SH failed: {err}"
+            )));
         }
         Ok(())
     }
@@ -246,11 +246,13 @@ impl AuditLedgerWriter for FileLedger {
                     (
                         last_ev.sequence + 1,
                         last_ev.event_hash,
-                        last_ev.timestamp.parse::<u64>().ok(),
+                        crate::parse_timestamp_nanos(&last_ev.timestamp),
                     )
                 }
             };
 
+            // Strictly increasing within the ledger, even if the host clock steps backwards or
+            // the previous record was written by the Python package in RFC 3339 form.
             let timestamp = last_ts
                 .map_or(now_ns, |lts| now_ns.max(lts.saturating_add(1)))
                 .to_string();
@@ -281,6 +283,7 @@ impl AuditLedgerWriter for FileLedger {
                 prev_hash,
                 event_hash,
                 signature,
+                hash_version: HASH_VERSION,
             };
 
             let line = event.to_json_line();
@@ -362,8 +365,8 @@ impl AuditLedgerReader for FileLedger {
         let mut events = Vec::new();
 
         for (idx, line_res) in reader.lines().enumerate() {
-            let line = line_res
-                .map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
+            let line =
+                line_res.map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -374,20 +377,57 @@ impl AuditLedgerReader for FileLedger {
             events.push(event);
         }
 
-        if let Ok(file_ref) = File::open(&self.path) {
-            Self::flock_un(&file_ref);
-        }
-
+        // The shared lock belongs to `file`, which the `lines()` iterator owns; it is released
+        // when that iterator drops at the end of the loop. Unlocking a freshly opened descriptor
+        // would not touch it.
         Ok(events)
     }
 }
 
 impl AuditVerifier for FileLedger {
+    /// One pass over the file, parsing and checking each line as it is read: a 50k-record
+    /// ledger does not become 50k resident `AuditEvent`s (F3). A line that does not parse
+    /// fails the chain at that position (F2).
     fn verify_chain_with(
         &self,
         policy: &VerificationPolicy,
     ) -> Result<ChainVerificationReport, LedgerError> {
-        let events = self.all_events()?;
-        policy.verify(&events)
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        if !self.path.exists() {
+            return policy.verify_stream(std::iter::empty());
+        }
+
+        let file = File::open(&self.path)
+            .map_err(|e| LedgerError::LockError(format!("cannot open ledger for verify: {e}")))?;
+        Self::flock_sh(&file)?;
+
+        let mut io_error = None;
+        let records = BufReader::new(&file)
+            .lines()
+            .enumerate()
+            .map_while(|(idx, line_res)| match line_res {
+                Ok(line) => Some(line),
+                Err(e) => {
+                    io_error = Some(LedgerError::LockError(format!(
+                        "read line {} failed: {e}",
+                        idx + 1
+                    )));
+                    None
+                }
+            })
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(idx, line)| {
+                AuditEvent::from_json_line(line.trim()).map_err(|e| {
+                    LedgerError::InvalidInput(format!("malformed line {}: {e}", idx + 1))
+                })
+            });
+        let report = policy.verify_stream(records);
+        Self::flock_un(&file);
+        match io_error {
+            Some(e) => Err(e),
+            None => report,
+        }
     }
 }

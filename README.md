@@ -22,17 +22,17 @@ Agents run commands, call APIs and edit files. Afterwards the log is the only ac
 
 ## Install
 
-This README describes 0.1.0-alpha.6 (0.1.0a6 on PyPI). It is a pre-release, so name the version.
+This README describes 0.1.0-alpha.7 (0.1.0a7 on PyPI). It is a pre-release, so name the version.
 
 ```toml
 # Rust: Cargo.toml
 [dependencies]
-argus-ledger = "0.1.0-alpha.6"
+argus-ledger = "0.1.0-alpha.7"
 ```
 
 ```bash
 # Python
-pip install argus-ledger==0.1.0a6
+pip install argus-ledger==0.1.0a7
 ```
 
 ## Quickstart
@@ -74,11 +74,18 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 
 | Measurement | Result |
 | --- | --- |
-| Appends per second, 1,000,000 events, in memory | 1,113,765 |
-| Events verified per second, full walk | 3,110,589 |
-| Time to find an edit at event 500,000 | 155.4 ms |
+| Appends per second, 1,000,000 events, `InMemoryLedger` (no file, no fsync) | 1,113,765 |
+| Events verified per second, full walk over events already parsed in memory | 3,110,589 |
+| Time to find an edit at event 500,000, events already parsed in memory | 155.4 ms |
 | A fully re-hashed history passes a check without an anchor | yes |
 | The same history is caught by the anchor | yes |
+
+These are in-memory figures. They do not include opening and parsing a ledger file, and the
+append figure does not include durable storage. A durable append (`FileLedger` in Rust,
+`AppendOnlyLedger` in Python) syncs every record to disk and runs at the storage device's
+fsync rate, on the order of a thousand appends per second on typical SSDs. `argus-verify`
+reports end-to-end time (open, parse and verify) for a file; expect it to be several times
+lower than the verify-phase-only figure above because parsing dominates.
 
 ## How it works
 
@@ -92,8 +99,9 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 - **Detection, not prevention:** Argus cannot stop someone with write access from editing storage. It makes the edit visible.
 - **Linear chain:** Verification reads every event, so it takes time proportional to the ledger's length, and there are no inclusion proofs for single events.
 - **Anchoring requirement:** An unanchored chain that is rewritten and re-hashed from genesis is internally consistent. Keep the latest sequence number and hash somewhere the writer cannot change, and verify against it, to detect a complete rewrite.
-- **Storage scope:** The Rust crate provides `InMemoryLedger`. The Python package writes a local JSONL file locked with `fcntl`, so it runs on Linux and macOS, not Windows.
+- **Storage scope:** The Rust crate provides `InMemoryLedger` and `FileLedger`. The Python package writes a local JSONL file locked with `fcntl`, so it runs on Linux and macOS, not Windows.
 - **Not independently assessed:** No security review or certification has been completed. Designed for local and disconnected use.
+- **`argus_ledger.proofweave` is experimental:** the policy/evidence binding helpers may change or be removed before 1.0. `RAGTriadBinding.to_payload_dict()` emits float scores, which the ledger refuses; convert scores to integers (basis points) before appending.
 
 ## Security
 

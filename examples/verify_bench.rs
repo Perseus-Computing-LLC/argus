@@ -1,6 +1,6 @@
-use std::time::Instant;
-use std::io::{BufRead, BufReader};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::time::Instant;
 
 fn main() {
     let path = "/opt/data/runtime/argus/audit.jsonl";
@@ -8,12 +8,10 @@ fn main() {
     let reader = BufReader::new(file);
 
     let mut parsed_events = Vec::new();
-    for line in reader.lines() {
-        if let Ok(l) = line {
-            if l.contains("\"hash_version\":2") || l.contains("\"hash_version\": 2") {
-                if let Ok(ev) = argus_ledger::AuditEvent::from_json_line(&l) {
-                    parsed_events.push(ev);
-                }
+    for l in reader.lines().map_while(Result::ok) {
+        if l.contains("\"hash_version\":2") || l.contains("\"hash_version\": 2") {
+            if let Ok(ev) = argus_ledger::AuditEvent::from_json_line(&l) {
+                parsed_events.push(ev);
             }
         }
     }
@@ -39,5 +37,11 @@ fn main() {
     let elapsed = t0.elapsed();
     let ms = elapsed.as_secs_f64() * 1000.0;
     let rate = (verified as f64) / elapsed.as_secs_f64();
-    println!("Rust verified {}/{} hashes in {:.2} ms ({:.0} events/sec)", verified, parsed_events.len(), ms, rate);
+    println!(
+        "Rust verified {}/{} hashes in {:.2} ms ({:.0} events/sec)",
+        verified,
+        parsed_events.len(),
+        ms,
+        rate
+    );
 }

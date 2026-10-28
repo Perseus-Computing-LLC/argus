@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import datetime
 import json
 import os
 import tempfile
@@ -40,12 +41,12 @@ def _write(path, records):
             fh.write(json.dumps(record) + "\n")
 
 
-def _legacy_record(sequence, prev_hash, payload, key=None):
+def _legacy_record(sequence, prev_hash, payload, key=None, timestamp=None):
     """A record as written before hash_version existed: ':'-joined hash, untagged HMAC."""
     record = {
         "sequence": sequence,
         "event_id": f"legacy-{sequence}",
-        "timestamp": f"2026-10-01T00:00:0{sequence}+00:00",
+        "timestamp": timestamp or f"2026-10-01T00:00:0{sequence}+00:00",
         "event_type": "tool.exec",
         "actor": "agent",
         "payload": payload,
@@ -115,10 +116,12 @@ class TestHashFormat(unittest.TestCase):
 
     def test_reattributing_a_record_is_detected_even_when_relabelled_as_format_1(self):
         ledger = AppendOnlyLedger(self.path, signing_key=KEY)
-        ledger.append("policy.override:svc-ci", "alice", {"rule": "prod-freeze"})
+        # The writer applies the Rust identifier grammar now, so the boundary shift uses a
+        # dot: "policy.override.svc-ci"/"alice" versus "policy.override"/"svc-ci.alice".
+        ledger.append("policy.override.svc-ci", "alice", {"rule": "prod-freeze"})
         for relabel in (False, True):
             records = _records(self.path)
-            records[0]["event_type"], records[0]["actor"] = "policy.override", "svc-ci:alice"
+            records[0]["event_type"], records[0]["actor"] = "policy.override", "svc-ci.alice"
             if relabel:
                 records[0]["hash_version"] = 1
             _write(self.path, records)
@@ -154,8 +157,12 @@ class TestHashFormat(unittest.TestCase):
         after format-2 ones; the chain stays valid and tampering with those records is still detected."""
         ledger = AppendOnlyLedger(self.path)
         first = ledger.append("tool.exec", "agent", {"i": 1})
+        # The previous release's writer also stamps the current time, so its record is later
+        # than `first`; a fixed past date would be a back-dated record and must not verify.
+        later = (datetime.datetime.fromisoformat(first.timestamp)
+                 + datetime.timedelta(microseconds=1)).isoformat()
         with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(_legacy_record(2, first.event_hash, {"i": 2})) + "\n")
+            fh.write(json.dumps(_legacy_record(2, first.event_hash, {"i": 2}, timestamp=later)) + "\n")
         third = ledger.append("tool.exec", "agent", {"i": 3})
         self.assertEqual((third.sequence, third.hash_version), (3, CURRENT_HASH_VERSION))
         report = ledger.verify_chain()

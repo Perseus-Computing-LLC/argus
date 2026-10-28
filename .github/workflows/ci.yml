@@ -70,6 +70,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install pydantic cryptography pytest hatchling build
 
+      # The cross-language tests (tests/test_file_ledger_cross.py, tests/test_cross_verifier_matrix.py)
+      # need rustc, target/{debug,release}/libargus_ledger.rlib and target/release/argus-verify.
+      # Without them they skip on a developer machine; in CI (CI=true) they fail instead, so the
+      # Python/Rust byte-for-byte agreement is checked on every run.
+      - name: Set up Rust toolchain for the cross-language tests
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, pinned 2026-10-25
+        with:
+          toolchain: 1.97.1
+
+      - name: Build the Rust crate (debug and release)
+        run: |
+          cargo build --locked
+          cargo build --locked --release
+
       # Installs the built wheel the way a user would: dependencies resolved from PyPI, no --no-deps.
       - name: Install the wheel with its dependencies in a clean venv
         shell: bash

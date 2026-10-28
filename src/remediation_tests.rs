@@ -521,7 +521,7 @@ fn opt_canonical_u64_parse_matches_the_allocating_reference() {
         "018446744073709551615",
         "1783000000000000000",
     ] {
-        assert_eq!(parse_canonical_u64(s), reference(s), "input {s:?}");
+        assert_eq!(parse_timestamp_nanos(s), reference(s), "input {s:?}");
     }
 }
 
@@ -634,7 +634,11 @@ fn test_file_ledger_golden_hash_parity_and_cross_compat() {
     );
 
     let ev = ledger
-        .append("tool.exec", "arn:aws:iam::123456789012:user/alice", payload1)
+        .append(
+            "tool.exec",
+            "arn:aws:iam::123456789012:user/alice",
+            payload1,
+        )
         .expect("append");
 
     // Override event_hash computation test against golden hash
@@ -662,6 +666,333 @@ fn test_file_ledger_golden_hash_parity_and_cross_compat() {
     assert!(report.valid);
 
     std::fs::remove_dir_all(tmp).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2026-10-28 review repair set. Tests are named `rv_<finding>_...`.
+// ---------------------------------------------------------------------------------------------
+
+/// Every byte the identifier grammar accepts must survive `to_json_line` -> `from_json_line`
+/// unchanged, otherwise the writer can produce a record its own reader rejects.
+#[test]
+fn rv_f1_every_accepted_identifier_byte_round_trips_through_the_json_line() {
+    let ledger = InMemoryLedger::new();
+    let mut accepted_actor_bytes = 0;
+    for b in 0u8..=0x7f {
+        let actor = format!("x{}y", b as char);
+        if validate_identifiers("t.e", &actor).is_err() {
+            continue;
+        }
+        accepted_actor_bytes += 1;
+        let ev = ledger.append("t.e", &actor, "{}").unwrap();
+        let line = ev.to_json_line();
+        assert_eq!(
+            AuditEvent::from_json_line(&line).unwrap(),
+            ev,
+            "actor byte {b:#04x}"
+        );
+    }
+    // 0x21..=0x7e is 94 graphic bytes; minus '"' and '\' leaves 92.
+    assert_eq!(accepted_actor_bytes, 92);
+    for b in 0u8..=0x7f {
+        let event_type = format!("a{}b", b as char);
+        if validate_identifiers(&event_type, "w").is_err() {
+            continue;
+        }
+        let ev = ledger.append(&event_type, "w", "{}").unwrap();
+        assert_eq!(AuditEvent::from_json_line(&ev.to_json_line()).unwrap(), ev);
+    }
+    assert!(ledger.verify_chain().unwrap().valid);
+}
+
+#[test]
+fn rv_f1_actor_with_quote_or_backslash_is_rejected_before_recording() {
+    let ledger = InMemoryLedger::new();
+    for actor in ["a\"b", "a\\b", "\"", "\\", "a\\\"b"] {
+        let result = ledger.append("tool.exec", actor, "{}");
+        assert!(
+            matches!(result, Err(LedgerError::InvalidInput(_))),
+            "{actor:?}"
+        );
+    }
+    assert!(ledger.all_events().unwrap().is_empty());
+}
+
+/// The serializer must escape even what the grammar should have stopped (defense in depth), and
+/// a signature is quoted too.
+#[test]
+fn rv_f1_hand_built_event_with_json_syntax_in_strings_still_parses_back() {
+    let mut ev = ledger_with(1).all_events().unwrap().remove(0);
+    ev.actor = "a\"b\\c\n\u{1}".into();
+    ev.event_id = "id\"".into();
+    ev.timestamp = "ts\\".into();
+    ev.event_type = "x\"y".into();
+    ev.signature = Some("sig\"\\".into());
+    let line = ev.to_json_line();
+    assert!(!line.contains('\n'), "a record is exactly one line");
+    assert_eq!(AuditEvent::from_json_line(&line).unwrap(), ev);
+}
+
+/// Byte-for-byte compatibility with the record format every release so far has written and
+/// the Python writer produces: same field order, `"signature":null` when unsigned.
+#[test]
+fn rv_f1_json_line_bytes_and_field_order_are_unchanged() {
+    let ev = AuditEvent {
+        sequence: 1,
+        event_id: "ev_0123456789abcdef0123456789abcdef_1".into(),
+        timestamp: "1760659200000000000".into(),
+        event_type: "tool.exec".into(),
+        actor: "arn:aws:iam::123456789012:user/alice".into(),
+        payload: "{\"command\":\"build\"}".into(),
+        prev_hash: GENESIS_PREV_HASH.into(),
+        event_hash: "3a7cfe22bc8ca5b032bca7defaaa1ac22f05c9922dff2bd5032e820f1a927f9b".into(),
+        signature: None,
+        hash_version: 2,
+    };
+    assert_eq!(
+        ev.to_json_line(),
+        "{\"sequence\":1,\"event_id\":\"ev_0123456789abcdef0123456789abcdef_1\",\
+         \"timestamp\":\"1760659200000000000\",\"event_type\":\"tool.exec\",\
+         \"actor\":\"arn:aws:iam::123456789012:user/alice\",\"payload\":{\"command\":\"build\"},\
+         \"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\
+         \"event_hash\":\"3a7cfe22bc8ca5b032bca7defaaa1ac22f05c9922dff2bd5032e820f1a927f9b\",\
+         \"signature\":null,\"hash_version\":2}"
+    );
+    let signed = AuditEvent {
+        signature: Some("ed25519:00".into()),
+        payload: "{\"k\":[1,{\"n\":null}],\"u\":\"\u{e9}\"}".into(),
+        ..ev
+    };
+    let line = signed.to_json_line();
+    assert!(line.contains(",\"signature\":\"ed25519:00\",\"hash_version\":2}"));
+    // The payload is spliced in verbatim: non-ASCII stays unescaped, as the Python writer does.
+    assert!(line.contains("\"payload\":{\"k\":[1,{\"n\":null}],\"u\":\"\u{e9}\"},"));
+}
+
+/// A ledger that spans the format change (format-1 records, then format-2) must verify in the
+/// library exactly as it does in the Python package and the CLI, and relabelling a record's
+/// format must not make it verify.
+#[test]
+fn rv_f17_legacy_format_1_records_verify_and_cannot_be_relabelled() {
+    let v1 = |sequence: u64, prev_hash: &str, payload: &str| {
+        let mut ev = AuditEvent {
+            sequence,
+            event_id: format!("legacy-{sequence}"),
+            timestamp: format!("2026-10-0{sequence}T00:00:00+00:00"),
+            event_type: "tool.exec".into(),
+            actor: "agent".into(),
+            payload: payload.into(),
+            prev_hash: prev_hash.into(),
+            event_hash: String::new(),
+            signature: None,
+            hash_version: 1,
+        };
+        ev.event_hash = legacy_v1_event_hash(&ev);
+        ev
+    };
+    let e1 = v1(1, GENESIS_PREV_HASH, "{\"i\":1}");
+    let e2 = v1(2, &e1.event_hash, "{\"i\":2}");
+    let mut e3 = AuditEvent {
+        sequence: 3,
+        event_id: "ev_3".into(),
+        timestamp: "2026-10-03T00:00:00+00:00".into(),
+        event_type: "tool.exec".into(),
+        actor: "agent".into(),
+        payload: "{\"i\":3}".into(),
+        prev_hash: e2.event_hash.clone(),
+        event_hash: String::new(),
+        signature: None,
+        hash_version: 2,
+    };
+    e3.event_hash = compute_event_hash(
+        3,
+        &e3.event_id,
+        &e3.timestamp,
+        &e3.event_type,
+        &e3.actor,
+        &e3.prev_hash,
+        &e3.payload,
+    );
+    // Matches the Python reference `compute_event_hash(..., hash_version=1)`.
+    assert_eq!(
+        e1.event_hash,
+        sha256_hex(
+            format!(
+                "1:legacy-1:2026-10-01T00:00:00+00:00:tool.exec:agent:{GENESIS_PREV_HASH}:{{\"i\":1}}"
+            )
+            .as_bytes()
+        )
+    );
+
+    let report = VerificationPolicy::default()
+        .verify(&[e1.clone(), e2.clone(), e3.clone()])
+        .unwrap();
+    assert!(report.valid, "{:?}", report.error_detail);
+    assert_eq!((report.total_events, report.legacy_events), (3, 2));
+
+    // A record parsed from a line without hash_version is format 1 and round-trips as such.
+    let line = e1.to_json_line().replace(",\"hash_version\":1}", "}");
+    let parsed = AuditEvent::from_json_line(&line).unwrap();
+    assert_eq!(parsed, e1);
+    assert!(AuditEvent::from_json_line(&line.replace('}', ",\"hash_version\":3}")).is_err());
+
+    for (position, relabel) in [(1usize, 2u8), (2, 2), (3, 1)] {
+        let mut events = vec![e1.clone(), e2.clone(), e3.clone()];
+        events[position - 1].hash_version = relabel;
+        let report = VerificationPolicy::default().verify(&events).unwrap();
+        assert_eq!(report.first_broken_sequence, Some(position as u64));
+        assert!(matches!(report.failure, Some(LedgerError::HashMismatch(_))));
+    }
+}
+
+/// F3: a long ledger verifies in one pass from disk, and a fault at the end is still found at
+/// the right position. Correctness over a 50k-record file; memory is checked by inspection
+/// (`verify_chain_with` never builds a `Vec<AuditEvent>`).
+#[test]
+fn rv_f3_file_ledger_verifies_50k_records_streaming_and_finds_a_fault_at_the_tail() {
+    let dir = tempfile_dir("rv_f3");
+    let path = dir.join("audit.jsonl");
+    const N: u64 = 50_000;
+    // Build the chain in memory (FileLedger::append syncs every record, which is the point of
+    // the writer but far too slow for 50k test records) and write it as one file.
+    let source = InMemoryLedger::new();
+    let mut content = String::new();
+    for i in 0..N {
+        let ev = source
+            .append("tool.exec", "agent", &format!("{{\"i\":{i}}}"))
+            .unwrap();
+        content.push_str(&ev.to_json_line());
+        content.push('\n');
+    }
+    std::fs::write(&path, &content).unwrap();
+    let ledger = FileLedger::new(&path).unwrap();
+    let report = ledger.verify_chain().unwrap();
+    assert!(report.valid, "{:?}", report.error_detail);
+    assert_eq!(report.total_events, N as usize);
+    assert_eq!(report.head_hash, ledger.head().unwrap().unwrap().event_hash);
+
+    let anchor = ChainAnchor {
+        sequence: N,
+        event_hash: report.head_hash.clone(),
+    };
+    let policy = VerificationPolicy {
+        anchor: Some(anchor),
+        verifying_key: None,
+    };
+    assert!(ledger.verify_chain_with(&policy).unwrap().valid);
+
+    // Flip one payload byte in the last record: found at position N with the right counts.
+    let last_payload = format!("\"i\":{}", N - 1);
+    let pos = content.rfind(&last_payload).unwrap();
+    content.replace_range(pos..pos + last_payload.len(), &format!("\"i\":{N}"));
+    std::fs::write(&path, &content).unwrap();
+    let report = ledger.verify_chain().unwrap();
+    assert!(!report.valid);
+    assert_eq!(report.first_broken_sequence, Some(N));
+    assert_eq!(report.total_events, N as usize);
+    assert!(matches!(report.failure, Some(LedgerError::HashMismatch(_))));
+
+    // Truncate the tail: the anchor is no longer witnessed.
+    let keep = content.rfind('\n').unwrap();
+    std::fs::write(&path, &content[..keep]).unwrap();
+    let report = ledger.verify_chain_with(&policy).unwrap();
+    assert!(!report.valid);
+    assert_eq!(report.first_broken_sequence, Some(N));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A line that is not a record fails the library verifier at its position, with the same
+/// report shape the Python package produces.
+#[test]
+fn rv_f2_file_ledger_verify_fails_closed_on_a_malformed_line() {
+    let dir = tempfile_dir("rv_f2");
+    let path = dir.join("audit.jsonl");
+    let ledger = FileLedger::new(&path).unwrap();
+    ledger.append("a.b", "x", "{}").unwrap();
+    let ev2 = ledger.append("a.b", "x", "{}").unwrap();
+    let mut content = std::fs::read_to_string(&path).unwrap();
+    content.push_str("{\"sequence\":3,\"event_id\":\"torn\n");
+    std::fs::write(&path, content).unwrap();
+    let report = ledger.verify_chain().unwrap();
+    assert!(!report.valid);
+    assert_eq!(report.first_broken_sequence, Some(3));
+    assert_eq!(report.total_events, 3);
+    assert!(matches!(report.failure, Some(LedgerError::InvalidInput(_))));
+    assert_eq!(report.head_hash, ev2.event_hash);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// F5: timestamps compare as instants whatever their written form, so the Python package's
+/// RFC 3339 records (with `+00:00`, another offset, `Z` or no suffix) and the Rust writers'
+/// nanosecond integers obey one strictly-increasing rule.
+#[test]
+fn rv_f5_timestamps_parse_as_instants_across_offsets_and_forms() {
+    const T: u64 = 1_793_145_600_000_000_000; // 2026-10-28T00:00:00Z
+    for (text, expect) in [
+        ("1793145600000000000", Some(T)),
+        ("2026-10-28T00:00:00+00:00", Some(T)),
+        ("2026-10-28T00:00:00Z", Some(T)),
+        ("2026-10-28T00:00:00", Some(T)),
+        ("2026-10-28T05:00:00+05:00", Some(T)),
+        ("2026-10-27T19:30:00-04:30", Some(T)),
+        ("2026-10-28T00:00:00.123456+00:00", Some(T + 123_456_000)),
+        ("2026-10-28T00:00:00.123456789Z", Some(T + 123_456_789)),
+        ("2026-10-28T00:00:00.1234567891Z", Some(T + 123_456_789)),
+        ("2026-10-28T00:00:00.+00:00", None),
+        ("2026-10-28T00:00:00+0500", None),
+        ("2026-10-28T00:00:00+15:00", None),
+        ("2026-10-28T00:00:00+05:60", None),
+        ("2026-10-28T00:00:00x", None),
+        ("2026-13-28T00:00:00Z", None),
+        ("01793145600000000000", None),
+        ("", None),
+    ] {
+        assert_eq!(parse_timestamp_nanos(text), expect, "{text:?}");
+    }
+    // Textually later, earlier as an instant: the verifier must compare instants.
+    let a = parse_timestamp_nanos("2026-10-28T00:00:00+00:00").unwrap();
+    let b = parse_timestamp_nanos("2026-10-28T04:59:59+05:00").unwrap();
+    assert!(b < a);
+}
+
+/// A Rust writer appending after a Python record (RFC 3339) still produces a strictly later
+/// instant, even if the host clock is behind that record.
+#[test]
+fn rv_f5_rust_writer_stays_monotonic_after_a_python_written_record() {
+    let dir = tempfile_dir("rv_f5");
+    let path = dir.join("audit.jsonl");
+    let far_future = "2500-01-01T00:00:00.000000+00:00";
+    let mut first = AuditEvent {
+        sequence: 1,
+        event_id: "py-1".into(),
+        timestamp: far_future.into(),
+        event_type: "tool.exec".into(),
+        actor: "agent".into(),
+        payload: "{}".into(),
+        prev_hash: GENESIS_PREV_HASH.into(),
+        event_hash: String::new(),
+        signature: None,
+        hash_version: 2,
+    };
+    first.event_hash = compute_event_hash(
+        1,
+        "py-1",
+        far_future,
+        "tool.exec",
+        "agent",
+        GENESIS_PREV_HASH,
+        "{}",
+    );
+    std::fs::write(&path, first.to_json_line() + "\n").unwrap();
+    let ledger = FileLedger::new(&path).unwrap();
+    let second = ledger.append("tool.exec", "agent", "{}").unwrap();
+    assert_eq!(
+        parse_timestamp_nanos(&second.timestamp),
+        Some(parse_timestamp_nanos(far_future).unwrap() + 1)
+    );
+    let report = ledger.verify_chain().unwrap();
+    assert!(report.valid, "{:?}", report.error_detail);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 fn tempfile_dir(prefix: &str) -> std::path::PathBuf {

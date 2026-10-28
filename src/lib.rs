@@ -89,7 +89,13 @@ pub struct AuditEvent {
     pub event_hash: String,
     /// Optional detached cryptographic signature verifying author authenticity.
     pub signature: Option<String>,
+    /// Hash format of this record: 2 (current, length-prefixed and domain-tagged) or 1 (legacy
+    /// `:`-joined preimage, verify-only). Records written before the field existed parse as 1.
+    pub hash_version: u8,
 }
+
+/// Hash format written by this version of the crate.
+pub const HASH_VERSION: u8 = 2;
 
 /// Cryptographic integrity verification report for an event chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +117,8 @@ pub struct ChainVerificationReport {
     pub failure: Option<LedgerError>,
     /// Timestamp when verification was completed in seconds since UNIX epoch.
     pub checked_at: String,
+    /// Events verified under hash format 1, whose field boundaries are not bound into the hash.
+    pub legacy_events: usize,
 }
 
 /// Externally witnessed commitment to one chain position, such as a head published to a
@@ -144,76 +152,124 @@ impl AuditEvent {
         }
     }
 
-    /// Serialize event to a single-line canonical JSON record.
+    /// Serialize event to a single-line JSON record.
+    ///
+    /// Every string field goes through serde_json so `"`, `\` and control characters are
+    /// escaped: a raw `format!` once let an actor such as `a"b` write a line no reader could
+    /// parse. `payload` is spliced in verbatim as a `RawValue` because it is already canonical
+    /// JSON (checked by `append`); re-encoding it could change the bytes the hash commits to.
+    /// Field order is fixed and matches the Python writer, so the line is byte-identical to
+    /// what earlier releases wrote for the same event.
+    ///
+    /// # Panics
+    ///
+    /// If `payload` is not valid JSON. Events produced by a ledger always satisfy this; only a
+    /// hand-built `AuditEvent` can violate it.
     pub fn to_json_line(&self) -> String {
-        let sig = match &self.signature {
-            Some(s) => format!("\"{}\"", s),
-            None => "null".to_string(),
-        };
-        format!(
-            "{{\"sequence\":{},\"event_id\":\"{}\",\"timestamp\":\"{}\",\"event_type\":\"{}\",\"actor\":\"{}\",\"payload\":{},\"prev_hash\":\"{}\",\"event_hash\":\"{}\",\"signature\":{},\"hash_version\":2}}",
-            self.sequence,
-            self.event_id,
-            self.timestamp,
-            self.event_type,
-            self.actor,
-            self.payload,
-            self.prev_hash,
-            self.event_hash,
-            sig,
-        )
+        #[derive(serde::Serialize)]
+        struct Wire<'a> {
+            sequence: u64,
+            event_id: &'a str,
+            timestamp: &'a str,
+            event_type: &'a str,
+            actor: &'a str,
+            payload: &'a serde_json::value::RawValue,
+            prev_hash: &'a str,
+            event_hash: &'a str,
+            signature: Option<&'a str>,
+            hash_version: u8,
+        }
+        let payload: &serde_json::value::RawValue = serde_json::from_str(&self.payload)
+            .expect("AuditEvent.payload must be valid JSON (append guarantees it)");
+        serde_json::to_string(&Wire {
+            sequence: self.sequence,
+            event_id: &self.event_id,
+            timestamp: &self.timestamp,
+            event_type: &self.event_type,
+            actor: &self.actor,
+            payload,
+            prev_hash: &self.prev_hash,
+            event_hash: &self.event_hash,
+            signature: self.signature.as_deref(),
+            hash_version: self.hash_version,
+        })
+        .expect("Wire holds only integers and strings; serialization cannot fail")
     }
 
     /// Parse an event from a JSON line, extracting canonical payload.
     pub fn from_json_line(line: &str) -> Result<Self, LedgerError> {
         let v: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-        let obj = v.as_object()
-            .ok_or_else(|| LedgerError::InvalidInput("event record must be a JSON object".into()))?;
+        let obj = v.as_object().ok_or_else(|| {
+            LedgerError::InvalidInput("event record must be a JSON object".into())
+        })?;
 
-        let sequence = obj.get("sequence")
+        let sequence = obj
+            .get("sequence")
             .and_then(|s| s.as_u64())
             .ok_or_else(|| LedgerError::InvalidInput("missing sequence".into()))?;
 
-        let event_id = obj.get("event_id")
+        let event_id = obj
+            .get("event_id")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing event_id".into()))?
             .to_string();
 
-        let timestamp = obj.get("timestamp")
+        let timestamp = obj
+            .get("timestamp")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing timestamp".into()))?
             .to_string();
 
-        let event_type = obj.get("event_type")
+        let event_type = obj
+            .get("event_type")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing event_type".into()))?
             .to_string();
 
-        let actor = obj.get("actor")
+        let actor = obj
+            .get("actor")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing actor".into()))?
             .to_string();
 
-        let payload_val = obj.get("payload")
+        let payload_val = obj
+            .get("payload")
             .ok_or_else(|| LedgerError::InvalidInput("missing payload".into()))?;
 
         let payload = serde_json::to_string(payload_val)
             .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
 
-        let prev_hash = obj.get("prev_hash")
+        let prev_hash = obj
+            .get("prev_hash")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing prev_hash".into()))?
             .to_string();
 
-        let event_hash = obj.get("event_hash")
+        let event_hash = obj
+            .get("event_hash")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing event_hash".into()))?
             .to_string();
 
-        let signature = obj.get("signature")
+        let signature = obj
+            .get("signature")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
+
+        // Absent means a record written before the field existed (format 1), as in the Python
+        // model. Any other value is a record this crate cannot verify, so it must not parse.
+        let hash_version = match obj.get("hash_version") {
+            None => 1,
+            Some(v) => match v.as_u64() {
+                Some(1) => 1,
+                Some(2) => 2,
+                _ => {
+                    let detail = format!("unsupported hash_version {v}");
+                    return Err(LedgerError::InvalidInput(detail));
+                }
+            },
+        };
 
         Ok(Self {
             sequence,
@@ -225,6 +281,7 @@ impl AuditEvent {
             prev_hash,
             event_hash,
             signature,
+            hash_version,
         })
     }
 }
@@ -493,6 +550,9 @@ pub const MAX_IDENTIFIER_BYTES: usize = 256;
 
 /// `event_type`: dot-separated `[a-z0-9_-]+` segments. `actor`: printable ASCII without
 /// whitespace, which rules out control characters, log-line injection, and Unicode homoglyphs.
+/// `"` (0x22) and `\` (0x5C) are ASCII-graphic but are JSON string syntax; they are excluded so
+/// an actor can never carry JSON structure even if a future serializer forgets to escape it.
+/// The Python writer (`argus_ledger.canonical.validate_identifiers`) applies the same grammar.
 fn validate_identifiers(event_type: &str, actor: &str) -> Result<(), LedgerError> {
     let type_byte = |b: u8| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
     let segment = |s: &str| !s.is_empty() && s.bytes().all(type_byte);
@@ -500,11 +560,9 @@ fn validate_identifiers(event_type: &str, actor: &str) -> Result<(), LedgerError
         let detail = "event_type must be dot-separated [a-z0-9_-]+ segments";
         return Err(LedgerError::InvalidInput(detail.into()));
     }
-    if actor.is_empty()
-        || actor.len() > MAX_IDENTIFIER_BYTES
-        || !actor.bytes().all(|b| b.is_ascii_graphic())
-    {
-        let detail = "actor must be printable ASCII without whitespace";
+    let actor_byte = |b: u8| b.is_ascii_graphic() && b != b'"' && b != b'\\';
+    if actor.is_empty() || actor.len() > MAX_IDENTIFIER_BYTES || !actor.bytes().all(actor_byte) {
+        let detail = "actor must be printable ASCII without whitespace, quotes or backslashes";
         return Err(LedgerError::InvalidInput(detail.into()));
     }
     Ok(())
@@ -576,8 +634,11 @@ impl std::io::Write for MatchesWriter<'_> {
     }
 }
 
-/// Parse a decimal `u64` in canonical form (no sign, no leading zeros), or ISO-8601 UTC timestamp.
-fn parse_canonical_u64(s: &str) -> Option<u64> {
+/// Parse a record timestamp to nanoseconds since the UNIX epoch: either a decimal `u64` in
+/// canonical form (no sign, no leading zeros; what the Rust writers emit) or an RFC 3339 date-time
+/// with any UTC offset (what the Python writer emits). Both forms compare as instants, so the
+/// timestamp contract, strictly increasing within a ledger, holds across writers.
+pub fn parse_timestamp_nanos(s: &str) -> Option<u64> {
     let canonical = s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
     if canonical {
         if let Ok(v) = s.parse() {
@@ -587,7 +648,33 @@ fn parse_canonical_u64(s: &str) -> Option<u64> {
     parse_iso8601_nanos(s)
 }
 
+/// Split a trailing `Z`, `+hh:mm` or `-hh:mm` off an ISO-8601 string and return the offset in
+/// seconds east of UTC. No suffix is treated as UTC. Returns None for a malformed offset.
+/// Before this existed `+05:00` records failed to parse and `Z` records were read as UTC only by
+/// luck of the fraction parser, so Python-written ledgers could not be verified by this crate.
+fn split_utc_offset(s: &str) -> Option<(&str, i64)> {
+    if let Some(body) = s.strip_suffix('Z') {
+        return Some((body, 0));
+    }
+    let Some(cut) = s.len().checked_sub(6) else {
+        return Some((s, 0));
+    };
+    let (body, off) = s.split_at(cut);
+    let sign = match off.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return Some((s, 0)), // no offset present (e.g. ends in fraction digits)
+    };
+    if off.as_bytes()[3] != b':' {
+        return None;
+    }
+    let hh: i64 = off[1..3].parse().ok()?;
+    let mm: i64 = off[4..6].parse().ok()?;
+    (hh <= 14 && mm <= 59).then_some((body, sign * (hh * 3600 + mm * 60)))
+}
+
 fn parse_iso8601_nanos(s: &str) -> Option<u64> {
+    let (s, offset_secs) = split_utc_offset(s)?;
     let bytes = s.as_bytes();
     if bytes.len() < 19
         || bytes.get(4) != Some(&b'-')
@@ -605,44 +692,37 @@ fn parse_iso8601_nanos(s: &str) -> Option<u64> {
     let min: u64 = s.get(14..16)?.parse().ok()?;
     let sec: u64 = s.get(17..19)?.parse().ok()?;
 
-    if m < 1 || m > 12 || d < 1 || d > 31 || hour > 23 || min > 59 || sec > 60 {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hour > 23 || min > 59 || sec > 60 {
         return None;
     }
 
+    // Days from civil (Howard Hinnant's algorithm), valid for the proleptic Gregorian calendar.
     let y_adj = y - if m <= 2 { 1 } else { 0 };
     let era = (if y_adj >= 0 { y_adj } else { y_adj - 399 }) / 400;
     let yoe = (y_adj - era * 400) as u64;
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe as i64 - 719468;
-    if days < 0 {
-        return None;
-    }
-    let epoch_secs = (days as u64) * 86400 + hour * 3600 + min * 60 + sec;
+    let local_secs = days * 86400 + (hour * 3600 + min * 60 + sec) as i64;
+    let epoch_secs = u64::try_from(local_secs - offset_secs).ok()?;
 
     let mut nanos = 0u64;
-    let rest = &s[19..];
-    if rest.starts_with('.') {
-        let num_end = rest[1..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map(|i| i + 1)
-            .unwrap_or(rest.len());
-        let frac_str = &rest[1..num_end];
-        let mut frac_val: u64 = frac_str.parse().ok()?;
-        let digits = frac_str.len();
-        if digits < 9 {
-            for _ in 0..(9 - digits) {
-                frac_val *= 10;
-            }
-        } else if digits > 9 {
-            for _ in 0..(digits - 9) {
-                frac_val /= 10;
-            }
+    if let Some(frac) = s[19..].strip_prefix('.') {
+        // Only digits may follow the dot now that the offset has been split off.
+        if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let digits = frac.len().min(9);
+        let mut frac_val: u64 = frac[..digits].parse().ok()?;
+        for _ in digits..9 {
+            frac_val *= 10;
         }
         nanos = frac_val;
+    } else if s.len() != 19 {
+        return None;
     }
 
-    Some(epoch_secs.checked_mul(1_000_000_000)?.checked_add(nanos)?)
+    epoch_secs.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
 /// Thread-safe in-memory reference implementation of an append-only audit ledger.
@@ -728,9 +808,10 @@ impl AuditLedgerWriter for InMemoryLedger {
         };
 
         // Strictly increasing within the ledger, even if the host clock steps backwards.
+        // The last record may be in either form (a Python writer may have appended before us).
         let timestamp = store
             .last()
-            .and_then(|last| last.timestamp.parse::<u64>().ok())
+            .and_then(|last| parse_timestamp_nanos(&last.timestamp))
             .map_or(now_ns, |last_ns| now_ns.max(last_ns.saturating_add(1)))
             .to_string();
         let event_id = format!("ev_{}_{}", self.ledger_id, sequence);
@@ -753,6 +834,7 @@ impl AuditLedgerWriter for InMemoryLedger {
             prev_hash,
             event_hash,
             signature,
+            hash_version: HASH_VERSION,
         });
         store.push(Arc::clone(&event));
         drop(store); // the caller's copy is made outside the critical section
@@ -795,64 +877,184 @@ impl AuditVerifier for InMemoryLedger {
 }
 
 impl VerificationPolicy {
-    /// Verify an exported or persisted event sequence, such as the output of `all_events()`.
+    /// Verify an exported or in-memory event sequence, such as the output of `all_events()`.
     /// Without `self.anchor` this proves internal consistency only.
     pub fn verify<E: Borrow<AuditEvent>>(
         &self,
         events: &[E],
     ) -> Result<ChainVerificationReport, LedgerError> {
-        let events: Vec<&AuditEvent> = events.iter().map(Borrow::<AuditEvent>::borrow).collect();
+        self.verify_stream(events.iter().map(|e| Ok(e.borrow().clone())))
+    }
+
+    /// Verify records as they are produced, holding one record at a time, so a file of any
+    /// length costs constant memory. An `Err` item is a record that could not be parsed: it
+    /// fails the chain at the position it would have occupied (fail closed), which is how the
+    /// Python package and the `argus-verify` CLI treat a torn or vandalised line.
+    ///
+    /// On failure `total_events` is the number of records examined up to and including the
+    /// broken one and `head_hash` is the last record that verified; the rest of the input is
+    /// not consumed.
+    pub fn verify_stream<I>(&self, records: I) -> Result<ChainVerificationReport, LedgerError>
+    where
+        I: IntoIterator<Item = Result<AuditEvent, LedgerError>>,
+    {
+        let mut verifier = ChainVerifier::new(self);
+        for record in records {
+            match record {
+                Ok(event) => {
+                    if let Some(report) = verifier.push(&event) {
+                        return Ok(report);
+                    }
+                }
+                Err(error) => return Ok(verifier.fail_next(error)),
+            }
+        }
+        Ok(verifier.finish())
+    }
+}
+
+/// Incremental chain verifier behind [`VerificationPolicy::verify_stream`]: feed records in file
+/// order with [`ChainVerifier::push`], then call [`ChainVerifier::finish`]. Only the running
+/// state (expected link, last instant, counters) is kept between records.
+pub struct ChainVerifier<'a> {
+    policy: &'a VerificationPolicy,
+    position: u64,
+    expected_prev: String,
+    prev_timestamp: Option<u64>,
+    legacy_events: usize,
+    root_hash: String,
+    head_hash: String,
+    anchor_matched: bool,
+    checked_at: String,
+}
+
+impl<'a> ChainVerifier<'a> {
+    pub fn new(policy: &'a VerificationPolicy) -> Self {
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let checked_at = format!("{}", now_sec);
-
-        if events.is_empty() && self.anchor.is_none() {
-            return Ok(ChainVerificationReport {
-                valid: true,
-                total_events: 0,
-                root_hash: String::new(),
-                head_hash: String::new(),
-                first_broken_sequence: None,
-                error_detail: None,
-                failure: None,
-                checked_at,
-            });
+        Self {
+            policy,
+            position: 0,
+            expected_prev: GENESIS_PREV_HASH.to_string(),
+            prev_timestamp: None,
+            legacy_events: 0,
+            root_hash: String::new(),
+            head_hash: String::new(),
+            anchor_matched: false,
+            checked_at: format!("{now_sec}"),
         }
+    }
 
-        let root_hash = events
-            .first()
-            .map(|e| e.event_hash.clone())
-            .unwrap_or_default();
-        let head_hash = events
-            .last()
-            .map(|e| e.event_hash.clone())
-            .unwrap_or_default();
-        // `position` is computed by the verifier, never read from the record under test.
-        let fail = |position: u64, error: LedgerError| ChainVerificationReport {
+    /// Records examined so far.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// `position` is computed by the verifier, never read from the record under test.
+    fn report(&self, position: u64, error: LedgerError) -> ChainVerificationReport {
+        ChainVerificationReport {
             valid: false,
-            total_events: events.len(),
-            root_hash: root_hash.clone(),
-            head_hash: head_hash.clone(),
+            total_events: self.position as usize,
+            root_hash: self.root_hash.clone(),
+            head_hash: self.head_hash.clone(),
             first_broken_sequence: Some(position),
             error_detail: Some(error.to_string()),
             failure: Some(error),
-            checked_at: checked_at.clone(),
+            checked_at: self.checked_at.clone(),
+            legacy_events: self.legacy_events,
+        }
+    }
+
+    /// Fail the chain at the position the next record would have occupied: for a line that
+    /// could not be parsed into a record at all.
+    pub fn fail_next(&mut self, error: LedgerError) -> ChainVerificationReport {
+        self.position += 1;
+        self.report(self.position, error)
+    }
+
+    /// Check one record against the running state. `Some(report)` means the chain is broken
+    /// here and no further record should be pushed.
+    pub fn push(&mut self, event: &AuditEvent) -> Option<ChainVerificationReport> {
+        self.position += 1;
+        let seq = self.position;
+        if event.sequence != seq {
+            let detail = format!("position {seq} records sequence {}", event.sequence);
+            return Some(self.report(seq, LedgerError::SequenceDiscontinuity(detail)));
+        }
+        if event.prev_hash != self.expected_prev {
+            let detail = format!("broken prev_hash link at sequence {seq}");
+            return Some(self.report(seq, LedgerError::HashMismatch(detail)));
+        }
+        // The record's own hash_version selects the preimage. Relabelling cannot make a
+        // record verify: its stored hash commits to exactly one format.
+        if !event_hash_matches(event) {
+            let detail = format!("tampered content hash at sequence {seq}");
+            return Some(self.report(seq, LedgerError::HashMismatch(detail)));
+        }
+        let Some(timestamp) = parse_timestamp_nanos(&event.timestamp)
+            .filter(|&ns| self.prev_timestamp.is_none_or(|prev| ns > prev))
+        else {
+            let detail = format!("timestamp at sequence {seq} is malformed or not increasing");
+            return Some(self.report(seq, LedgerError::InvalidTimestamp(detail)));
         };
-        let mut expected_prev: &str = GENESIS_PREV_HASH;
-        let mut prev_timestamp: Option<u64> = None;
-        for (idx, event) in events.iter().enumerate() {
-            let seq = (idx as u64) + 1;
-            if event.sequence != seq {
-                let detail = format!("position {seq} records sequence {}", event.sequence);
-                return Ok(fail(seq, LedgerError::SequenceDiscontinuity(detail)));
+        if let Some(key) = &self.policy.verifying_key {
+            let signed = event.signature.as_deref().is_some_and(|signature| {
+                verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
+            });
+            if !signed {
+                let detail = format!("missing or invalid signature at sequence {seq}");
+                return Some(self.report(seq, LedgerError::InvalidSignature(detail)));
             }
-            if event.prev_hash != expected_prev {
-                let detail = format!("broken prev_hash link at sequence {seq}");
-                return Ok(fail(seq, LedgerError::HashMismatch(detail)));
+        }
+        if let Some(anchor) = &self.policy.anchor {
+            if anchor.sequence == seq {
+                if anchor.event_hash != event.event_hash {
+                    let detail = format!("chain does not contain anchored event {seq}");
+                    return Some(self.report(seq, LedgerError::HashMismatch(detail)));
+                }
+                self.anchor_matched = true;
             }
-            let expected_hash = event_hash_hex(
+        }
+        self.legacy_events += usize::from(event.hash_version == 1);
+        self.prev_timestamp = Some(timestamp);
+        if seq == 1 {
+            self.root_hash = event.event_hash.clone();
+        }
+        self.head_hash = event.event_hash.clone();
+        self.expected_prev = event.event_hash.clone();
+        None
+    }
+
+    /// End of input: the anchor, if any, must have been seen, otherwise the file was truncated
+    /// or rolled back below it.
+    pub fn finish(self) -> ChainVerificationReport {
+        if let Some(anchor) = &self.policy.anchor {
+            if !self.anchor_matched {
+                let detail = format!("chain does not contain anchored event {}", anchor.sequence);
+                return self.report(anchor.sequence, LedgerError::HashMismatch(detail));
+            }
+        }
+        ChainVerificationReport {
+            valid: true,
+            total_events: self.position as usize,
+            root_hash: self.root_hash,
+            head_hash: self.head_hash,
+            first_broken_sequence: None,
+            error_detail: None,
+            failure: None,
+            checked_at: self.checked_at,
+            legacy_events: self.legacy_events,
+        }
+    }
+}
+
+/// Recompute `event.event_hash` in the record's own format and compare.
+fn event_hash_matches(event: &AuditEvent) -> bool {
+    match event.hash_version {
+        2 => {
+            let expected = event_hash_hex(
                 event.sequence,
                 &event.event_id,
                 &event.timestamp,
@@ -861,51 +1063,30 @@ impl VerificationPolicy {
                 &event.prev_hash,
                 &payload_digest_hex(&event.payload),
             );
-            if event.event_hash.as_bytes() != expected_hash.as_slice() {
-                let detail = format!("tampered content hash at sequence {seq}");
-                return Ok(fail(seq, LedgerError::HashMismatch(detail)));
-            }
-            let Some(timestamp) = parse_canonical_u64(&event.timestamp)
-                .filter(|&ns| prev_timestamp.is_none_or(|prev| ns > prev))
-            else {
-                let detail = format!("timestamp at sequence {seq} is malformed or not increasing");
-                return Ok(fail(seq, LedgerError::InvalidTimestamp(detail)));
-            };
-            prev_timestamp = Some(timestamp);
-            if let Some(key) = &self.verifying_key {
-                let signed = event.signature.as_deref().is_some_and(|signature| {
-                    verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
-                });
-                if !signed {
-                    let detail = format!("missing or invalid signature at sequence {seq}");
-                    return Ok(fail(seq, LedgerError::InvalidSignature(detail)));
-                }
-            }
-            expected_prev = &event.event_hash;
+            event.event_hash.as_bytes() == expected.as_slice()
         }
-
-        if let Some(anchor) = &self.anchor {
-            let witnessed = usize::try_from(anchor.sequence)
-                .ok()
-                .and_then(|n| n.checked_sub(1))
-                .and_then(|i| events.get(i));
-            if witnessed.map(|e| &e.event_hash) != Some(&anchor.event_hash) {
-                let detail = format!("chain does not contain anchored event {}", anchor.sequence);
-                return Ok(fail(anchor.sequence, LedgerError::HashMismatch(detail)));
-            }
-        }
-
-        Ok(ChainVerificationReport {
-            valid: true,
-            total_events: events.len(),
-            root_hash,
-            head_hash,
-            first_broken_sequence: None,
-            error_detail: None,
-            failure: None,
-            checked_at,
-        })
+        1 => event.event_hash == legacy_v1_event_hash(event),
+        _ => false,
     }
+}
+
+/// Hash format 1, verify-only: SHA-256 over `seq:id:ts:type:actor:prev:` followed by the
+/// payload text. Fields were not length-prefixed, so text could move between adjacent fields
+/// without changing the hash; that is why format 2 replaced it. Kept so ledgers that span the
+/// format change still verify in the library as they do in the Python package.
+fn legacy_v1_event_hash(event: &AuditEvent) -> String {
+    let header = format!(
+        "{}:{}:{}:{}:{}:{}:",
+        event.sequence,
+        event.event_id,
+        event.timestamp,
+        event.event_type,
+        event.actor,
+        event.prev_hash
+    );
+    let mut hasher = Sha256::new_with_prefix(header.as_bytes());
+    hasher.update(event.payload.as_bytes());
+    hex_string(digest_hex(&hasher.finalize().into()))
 }
 
 #[cfg(test)]

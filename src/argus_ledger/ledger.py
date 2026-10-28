@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import calendar
 import datetime
 import fcntl
 import json
 import os
 import uuid
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, Optional
 from .hasher import (
     compute_event_hash,
     ed25519_public_key,
@@ -19,6 +20,8 @@ from .hasher import (
 )
 from .models import CURRENT_HASH_VERSION, AuditEvent, ChainAnchor, ChainVerificationReport, GENESIS_PREV_HASH
 from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier, LedgerCorruptionError
+from .canonical import validate_identifiers, validate_payload
+from .timestamps import timestamp_nanos
 
 _TAIL_BLOCK = 1 << 16
 
@@ -36,6 +39,21 @@ def _tail_record(fd: int) -> Optional[bytes]:
         if record and (newline >= 0 or pos == 0):
             return record[newline + 1:].strip()
     return None
+
+
+def _monotonic_utc_iso(last_instant: Optional[int]) -> str:
+    """Current UTC time as RFC 3339, forced at least one microsecond past ``last_instant`` (ns)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if last_instant is not None:
+        now_ns = (calendar.timegm(now.timetuple()) * 1_000_000 + now.microsecond) * 1000
+        floor_ns = last_instant + 1
+        if now_ns < floor_ns:
+            # Round up to the next whole microsecond so the emitted (microsecond) text is still
+            # strictly after a nanosecond-resolution Rust record.
+            floor_us = -(-floor_ns // 1000)
+            now = datetime.datetime.fromtimestamp(floor_us / 1_000_000, datetime.timezone.utc)
+            now = now.replace(microsecond=floor_us % 1_000_000)
+    return now.isoformat()
 
 
 def _count_records(path: str) -> int:
@@ -109,7 +127,9 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         eid = event_id or str(uuid.uuid4())
         if self._key is None and self._ed25519_public_key is not None:
             raise PermissionError("this ledger was opened with verify_key: it can check signatures but not append")
-        now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # Same gates as the Rust writer, before anything is locked or written.
+        validate_identifiers(event_type, actor)
+        validate_payload(payload)
 
         with open(self.ledger_path, "a+", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -117,6 +137,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                 size = os.fstat(f.fileno()).st_size
                 tail = _tail_record(f.fileno())
 
+                last_instant: Optional[int] = None
                 if tail is None:
                     sequence = 1
                     prev_hash = GENESIS_PREV_HASH
@@ -125,11 +146,18 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                         last_obj = json.loads(tail)
                         sequence = int(last_obj["sequence"]) + 1
                         prev_hash = str(last_obj["event_hash"])
+                        last_instant = timestamp_nanos(last_obj.get("timestamp", ""))
                     except (ValueError, KeyError, TypeError) as exc:
                         raise LedgerCorruptionError(
                             "Cannot append to ledger with corrupted tail record at line "
                             f"{_count_records(self.ledger_path)}: {exc}"
                         ) from exc
+
+                # Strictly increasing within the ledger even if the host clock steps backwards
+                # (seen in production: 47 decreasing transitions in 34k records). The guard is
+                # taken under the lock so two writers cannot pick the same instant. Format is
+                # unchanged: RFC 3339 UTC, explicit +00:00, microsecond resolution.
+                now_ts = _monotonic_utc_iso(last_instant)
 
                 event_hash = compute_event_hash(
                     sequence=sequence,
@@ -219,30 +247,41 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                 return event
         return None
 
-    def iter_events(self, start: int = 1, end: Optional[int] = None) -> Iterator[AuditEvent]:
+    def _iter_records(self) -> Iterator[AuditEvent]:
+        """Yield every record in file order, one at a time, under a shared lock.
+
+        A non-blank line that does not parse raises ``LedgerCorruptionError`` whose
+        ``position`` is the count of non-blank lines up to and including it: the chain
+        position the record should occupy, never a value read from the record."""
         if not os.path.exists(self.ledger_path):
             return
-
         with open(self.ledger_path, "r", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             try:
+                position = 0
                 for line_no, line in enumerate(f, start=1):
                     line = line.strip()
                     if not line:
                         continue
+                    position += 1
                     try:
-                        event = AuditEvent.model_validate_json(line)
+                        yield AuditEvent.model_validate_json(line)
                     except Exception as exc:
-                        raise LedgerCorruptionError(
+                        err = LedgerCorruptionError(
                             f"Malformed event record at line {line_no}: {exc}"
-                        ) from exc
-                    if event.sequence < start:
-                        continue
-                    if end is not None and event.sequence > end:
-                        break
-                    yield event
+                        )
+                        err.position = position  # type: ignore[attr-defined]
+                        raise err from exc
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def iter_events(self, start: int = 1, end: Optional[int] = None) -> Iterator[AuditEvent]:
+        for event in self._iter_records():
+            if event.sequence < start:
+                continue
+            if end is not None and event.sequence > end:
+                break
+            yield event
 
     def _signature_valid(self, event: AuditEvent) -> bool:
         if self._ed25519_public_key is not None:
@@ -257,60 +296,53 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         return f"Missing or invalid signature at sequence {position}"
 
     def verify_chain(self, anchor: Optional[ChainAnchor] = None) -> ChainVerificationReport:
-        """Verify sequence numbers, hash links, event hashes and, with a key, signatures.
+        """Verify sequence numbers, hash links, event hashes, timestamp order and, with a key,
+        signatures, in one pass over the file with one record resident at a time.
 
         Without ``anchor`` this proves internal consistency only: an empty, truncated or fully
         recomputed chain passes, and only a key stops someone who can write the file from
         recomputing it. ``anchor`` (``AuditEvent.anchor()`` kept where the writer cannot change it)
         also detects rollback, truncation below the anchor and rewritten history up to it.
-        ``first_broken_sequence`` is the chain position, never a value read from the record."""
+        ``first_broken_sequence`` is the chain position, never a value read from the record.
+        On failure ``total_events`` is the number of records read up to and including the
+        broken one; the rest of the file is not read."""
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         anchored = anchor is not None
 
-        raw_lines: List[str] = []
-        if os.path.exists(self.ledger_path):
-            with open(self.ledger_path, "r", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                try:
-                    raw_lines = [line.strip() for line in f if line.strip()]
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-        events: List[AuditEvent] = []
-        for idx, line in enumerate(raw_lines, start=1):
-            try:
-                events.append(AuditEvent.model_validate_json(line))
-            except Exception as exc:
-                return ChainVerificationReport(
-                    valid=False,
-                    total_events=len(raw_lines),
-                    root_hash=events[0].event_hash if events else "",
-                    head_hash=events[-1].event_hash if events else "",
-                    first_broken_sequence=idx,
-                    error_detail=f"Malformed or partial event record at sequence {idx}: {exc}",
-                    checked_at=now_ts,
-                    anchored=anchored,
-                )
-
-        root_hash = events[0].event_hash if events else ""
-        head_hash = events[-1].event_hash if events else ""
+        # Running state: a 50k-record ledger must not cost 50k resident models (F3).
+        position = 0
+        root_hash = ""
+        head_hash = ""
         legacy_events = 0
+        expected_prev = GENESIS_PREV_HASH
+        prev_instant: Optional[int] = None
+        anchor_matched = False
 
-        def broken(position: int, detail: str) -> ChainVerificationReport:
+        def broken(at: int, detail: str) -> ChainVerificationReport:
             return ChainVerificationReport(
                 valid=False,
-                total_events=len(events),
+                total_events=position,
                 root_hash=root_hash,
                 head_hash=head_hash,
-                first_broken_sequence=position,
+                first_broken_sequence=at,
                 error_detail=detail,
                 checked_at=now_ts,
                 legacy_events=legacy_events,
                 anchored=anchored,
             )
 
-        expected_prev = GENESIS_PREV_HASH
-        for idx, event in enumerate(events, start=1):
+        records = self._iter_records()
+        while True:
+            try:
+                event = next(records)
+            except StopIteration:
+                break
+            except LedgerCorruptionError as exc:
+                position = getattr(exc, "position", position + 1)
+                return broken(position, f"Malformed or partial event record at sequence {position}: {exc}")
+            position += 1
+            idx = position
+
             if event.sequence != idx:
                 return broken(idx, f"Sequence discontinuity: expected {idx}, found {event.sequence}")
 
@@ -324,20 +356,34 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             if not verify_event(event):
                 return broken(idx, f"Tampered payload or signature at sequence {idx}")
 
+            # Timestamp contract (shared with the Rust crate and argus-verify): strictly
+            # increasing as instants, so a replayed or back-dated record cannot be spliced in.
+            instant = timestamp_nanos(event.timestamp)
+            if instant is None or (prev_instant is not None and instant <= prev_instant):
+                return broken(idx, f"Timestamp at sequence {idx} is malformed or not increasing")
+
             if self._signed and not self._signature_valid(event):
                 return broken(idx, self._signature_error(event, idx))
 
+            if anchor is not None and anchor.sequence == idx:
+                if event.event_hash != anchor.event_hash:
+                    return broken(idx, f"Chain does not contain anchored event {idx}")
+                anchor_matched = True
+
             legacy_events += event.hash_version == 1
             expected_prev = event.event_hash
+            prev_instant = instant
+            if idx == 1:
+                root_hash = event.event_hash
+            head_hash = event.event_hash
 
-        if anchor is not None:
-            witnessed = events[anchor.sequence - 1] if anchor.sequence <= len(events) else None
-            if witnessed is None or witnessed.event_hash != anchor.event_hash:
-                return broken(anchor.sequence, f"Chain does not contain anchored event {anchor.sequence}")
+        if anchor is not None and not anchor_matched:
+            # The anchor lies beyond the head: the file was truncated or rolled back.
+            return broken(anchor.sequence, f"Chain does not contain anchored event {anchor.sequence}")
 
         return ChainVerificationReport(
             valid=True,
-            total_events=len(events),
+            total_events=position,
             root_hash=root_hash,
             head_hash=head_hash,
             checked_at=now_ts,
