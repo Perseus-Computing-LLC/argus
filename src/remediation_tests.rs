@@ -664,6 +664,99 @@ fn test_file_ledger_golden_hash_parity_and_cross_compat() {
     std::fs::remove_dir_all(tmp).ok();
 }
 
+// ---------------------------------------------------------------------------------------------
+// 2026-10-28 review repair set. Tests are named `rv_<finding>_...`.
+// ---------------------------------------------------------------------------------------------
+
+/// Every byte the identifier grammar accepts must survive `to_json_line` -> `from_json_line`
+/// unchanged, otherwise the writer can produce a record its own reader rejects.
+#[test]
+fn rv_f1_every_accepted_identifier_byte_round_trips_through_the_json_line() {
+    let ledger = InMemoryLedger::new();
+    let mut accepted_actor_bytes = 0;
+    for b in 0u8..=0x7f {
+        let actor = format!("x{}y", b as char);
+        if validate_identifiers("t.e", &actor).is_err() {
+            continue;
+        }
+        accepted_actor_bytes += 1;
+        let ev = ledger.append("t.e", &actor, "{}").unwrap();
+        let line = ev.to_json_line();
+        assert_eq!(AuditEvent::from_json_line(&line).unwrap(), ev, "actor byte {b:#04x}");
+    }
+    // 0x21..=0x7e is 94 graphic bytes; minus '"' and '\' leaves 92.
+    assert_eq!(accepted_actor_bytes, 92);
+    for b in 0u8..=0x7f {
+        let event_type = format!("a{}b", b as char);
+        if validate_identifiers(&event_type, "w").is_err() {
+            continue;
+        }
+        let ev = ledger.append(&event_type, "w", "{}").unwrap();
+        assert_eq!(AuditEvent::from_json_line(&ev.to_json_line()).unwrap(), ev);
+    }
+    assert!(ledger.verify_chain().unwrap().valid);
+}
+
+#[test]
+fn rv_f1_actor_with_quote_or_backslash_is_rejected_before_recording() {
+    let ledger = InMemoryLedger::new();
+    for actor in ["a\"b", "a\\b", "\"", "\\", "a\\\"b"] {
+        let result = ledger.append("tool.exec", actor, "{}");
+        assert!(matches!(result, Err(LedgerError::InvalidInput(_))), "{actor:?}");
+    }
+    assert!(ledger.all_events().unwrap().is_empty());
+}
+
+/// The serializer must escape even what the grammar should have stopped (defense in depth), and
+/// a signature is quoted too.
+#[test]
+fn rv_f1_hand_built_event_with_json_syntax_in_strings_still_parses_back() {
+    let mut ev = ledger_with(1).all_events().unwrap().remove(0);
+    ev.actor = "a\"b\\c\n\u{1}".into();
+    ev.event_id = "id\"".into();
+    ev.timestamp = "ts\\".into();
+    ev.event_type = "x\"y".into();
+    ev.signature = Some("sig\"\\".into());
+    let line = ev.to_json_line();
+    assert!(!line.contains('\n'), "a record is exactly one line");
+    assert_eq!(AuditEvent::from_json_line(&line).unwrap(), ev);
+}
+
+/// Byte-for-byte compatibility with the record format every release so far has written and
+/// the Python writer produces: same field order, `"signature":null` when unsigned.
+#[test]
+fn rv_f1_json_line_bytes_and_field_order_are_unchanged() {
+    let ev = AuditEvent {
+        sequence: 1,
+        event_id: "ev_0123456789abcdef0123456789abcdef_1".into(),
+        timestamp: "1760659200000000000".into(),
+        event_type: "tool.exec".into(),
+        actor: "arn:aws:iam::123456789012:user/alice".into(),
+        payload: "{\"command\":\"build\"}".into(),
+        prev_hash: GENESIS_PREV_HASH.into(),
+        event_hash: "3a7cfe22bc8ca5b032bca7defaaa1ac22f05c9922dff2bd5032e820f1a927f9b".into(),
+        signature: None,
+    };
+    assert_eq!(
+        ev.to_json_line(),
+        "{\"sequence\":1,\"event_id\":\"ev_0123456789abcdef0123456789abcdef_1\",\
+         \"timestamp\":\"1760659200000000000\",\"event_type\":\"tool.exec\",\
+         \"actor\":\"arn:aws:iam::123456789012:user/alice\",\"payload\":{\"command\":\"build\"},\
+         \"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\
+         \"event_hash\":\"3a7cfe22bc8ca5b032bca7defaaa1ac22f05c9922dff2bd5032e820f1a927f9b\",\
+         \"signature\":null,\"hash_version\":2}"
+    );
+    let signed = AuditEvent {
+        signature: Some("ed25519:00".into()),
+        payload: "{\"k\":[1,{\"n\":null}],\"u\":\"\u{e9}\"}".into(),
+        ..ev
+    };
+    let line = signed.to_json_line();
+    assert!(line.contains(",\"signature\":\"ed25519:00\",\"hash_version\":2}"));
+    // The payload is spliced in verbatim: non-ASCII stays unescaped, as the Python writer does.
+    assert!(line.contains("\"payload\":{\"k\":[1,{\"n\":null}],\"u\":\"\u{e9}\"},"));
+}
+
 fn tempfile_dir(prefix: &str) -> std::path::PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()

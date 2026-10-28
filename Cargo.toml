@@ -18,7 +18,8 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = ["allo
 getrandom = "0.4"
 # float_roundtrip: parse floats correctly rounded, so a payload written by the Python library
 # (repr: shortest round-trip) re-serializes to the same bytes and the event hash reproduces.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
+serde = { version = "1", features = ["derive"] }
 sha2 = { version = "0.11", default-features = false }
 
 [[bin]]

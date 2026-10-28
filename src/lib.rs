@@ -144,24 +144,48 @@ impl AuditEvent {
         }
     }
 
-    /// Serialize event to a single-line canonical JSON record.
+    /// Serialize event to a single-line JSON record.
+    ///
+    /// Every string field goes through serde_json so `"`, `\` and control characters are
+    /// escaped: a raw `format!` once let an actor such as `a"b` write a line no reader could
+    /// parse. `payload` is spliced in verbatim as a `RawValue` because it is already canonical
+    /// JSON (checked by `append`); re-encoding it could change the bytes the hash commits to.
+    /// Field order is fixed and matches the Python writer, so the line is byte-identical to
+    /// what earlier releases wrote for the same event.
+    ///
+    /// # Panics
+    ///
+    /// If `payload` is not valid JSON. Events produced by a ledger always satisfy this; only a
+    /// hand-built `AuditEvent` can violate it.
     pub fn to_json_line(&self) -> String {
-        let sig = match &self.signature {
-            Some(s) => format!("\"{}\"", s),
-            None => "null".to_string(),
-        };
-        format!(
-            "{{\"sequence\":{},\"event_id\":\"{}\",\"timestamp\":\"{}\",\"event_type\":\"{}\",\"actor\":\"{}\",\"payload\":{},\"prev_hash\":\"{}\",\"event_hash\":\"{}\",\"signature\":{},\"hash_version\":2}}",
-            self.sequence,
-            self.event_id,
-            self.timestamp,
-            self.event_type,
-            self.actor,
-            self.payload,
-            self.prev_hash,
-            self.event_hash,
-            sig,
-        )
+        #[derive(serde::Serialize)]
+        struct Wire<'a> {
+            sequence: u64,
+            event_id: &'a str,
+            timestamp: &'a str,
+            event_type: &'a str,
+            actor: &'a str,
+            payload: &'a serde_json::value::RawValue,
+            prev_hash: &'a str,
+            event_hash: &'a str,
+            signature: Option<&'a str>,
+            hash_version: u8,
+        }
+        let payload: &serde_json::value::RawValue = serde_json::from_str(&self.payload)
+            .expect("AuditEvent.payload must be valid JSON (append guarantees it)");
+        serde_json::to_string(&Wire {
+            sequence: self.sequence,
+            event_id: &self.event_id,
+            timestamp: &self.timestamp,
+            event_type: &self.event_type,
+            actor: &self.actor,
+            payload,
+            prev_hash: &self.prev_hash,
+            event_hash: &self.event_hash,
+            signature: self.signature.as_deref(),
+            hash_version: 2,
+        })
+        .expect("Wire holds only integers and strings; serialization cannot fail")
     }
 
     /// Parse an event from a JSON line, extracting canonical payload.
@@ -493,6 +517,9 @@ pub const MAX_IDENTIFIER_BYTES: usize = 256;
 
 /// `event_type`: dot-separated `[a-z0-9_-]+` segments. `actor`: printable ASCII without
 /// whitespace, which rules out control characters, log-line injection, and Unicode homoglyphs.
+/// `"` (0x22) and `\` (0x5C) are ASCII-graphic but are JSON string syntax; they are excluded so
+/// an actor can never carry JSON structure even if a future serializer forgets to escape it.
+/// The Python writer (`argus_ledger.canonical.validate_identifiers`) applies the same grammar.
 fn validate_identifiers(event_type: &str, actor: &str) -> Result<(), LedgerError> {
     let type_byte = |b: u8| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-');
     let segment = |s: &str| !s.is_empty() && s.bytes().all(type_byte);
@@ -500,11 +527,9 @@ fn validate_identifiers(event_type: &str, actor: &str) -> Result<(), LedgerError
         let detail = "event_type must be dot-separated [a-z0-9_-]+ segments";
         return Err(LedgerError::InvalidInput(detail.into()));
     }
-    if actor.is_empty()
-        || actor.len() > MAX_IDENTIFIER_BYTES
-        || !actor.bytes().all(|b| b.is_ascii_graphic())
-    {
-        let detail = "actor must be printable ASCII without whitespace";
+    let actor_byte = |b: u8| b.is_ascii_graphic() && b != b'"' && b != b'\\';
+    if actor.is_empty() || actor.len() > MAX_IDENTIFIER_BYTES || !actor.bytes().all(actor_byte) {
+        let detail = "actor must be printable ASCII without whitespace, quotes or backslashes";
         return Err(LedgerError::InvalidInput(detail.into()));
     }
     Ok(())
