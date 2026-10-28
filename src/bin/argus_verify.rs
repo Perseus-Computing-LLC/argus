@@ -268,25 +268,34 @@ fn main() {
                         std::process::exit(2);
                     }
                 };
-                let checkpoints_arr = if let Some(arr) = val.get("checkpoints").and_then(|c| c.as_array()) {
-                    arr.clone()
-                } else if let Some(arr) = val.as_array() {
-                    arr.clone()
-                } else if val.is_object() {
-                    vec![val]
-                } else {
-                    eprintln!("Error: anchor file must contain a checkpoint object or array");
-                    std::process::exit(2);
-                };
+                let checkpoints_arr =
+                    if let Some(arr) = val.get("checkpoints").and_then(|c| c.as_array()) {
+                        arr.clone()
+                    } else if let Some(arr) = val.as_array() {
+                        arr.clone()
+                    } else if val.is_object() {
+                        vec![val]
+                    } else {
+                        eprintln!("Error: anchor file must contain a checkpoint object or array");
+                        std::process::exit(2);
+                    };
                 for cp in checkpoints_arr {
-                    let seq = match cp.get("sequence").and_then(|s| s.as_u64()).or_else(|| cp.get("seq").and_then(|s| s.as_u64())) {
+                    let seq = match cp
+                        .get("sequence")
+                        .and_then(|s| s.as_u64())
+                        .or_else(|| cp.get("seq").and_then(|s| s.as_u64()))
+                    {
                         Some(s) => s,
                         None => {
                             eprintln!("Error: checkpoint missing sequence");
                             std::process::exit(2);
                         }
                     };
-                    let hash = match cp.get("head_hash").and_then(|h| h.as_str()).or_else(|| cp.get("event_hash").and_then(|h| h.as_str())) {
+                    let hash = match cp
+                        .get("head_hash")
+                        .and_then(|h| h.as_str())
+                        .or_else(|| cp.get("event_hash").and_then(|h| h.as_str()))
+                    {
                         Some(h) => h.to_string(),
                         None => {
                             eprintln!("Error: checkpoint missing head_hash");

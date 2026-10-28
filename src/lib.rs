@@ -244,23 +244,26 @@ impl AuditEvent {
             None => {
                 let v: serde_json::Value = serde_json::from_str(wire.payload.get())
                     .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-                let canon = serde_json::to_string(&v)
-                    .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
+                let canon = serde_json::to_string(&v).map_err(|e| {
+                    LedgerError::InvalidInput(format!("cannot serialize payload: {e}"))
+                })?;
                 (canon, 1)
             }
             Some(v) => match v.as_u64() {
                 Some(1) => {
                     let val: serde_json::Value = serde_json::from_str(wire.payload.get())
                         .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-                    let canon = serde_json::to_string(&val)
-                        .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
+                    let canon = serde_json::to_string(&val).map_err(|e| {
+                        LedgerError::InvalidInput(format!("cannot serialize payload: {e}"))
+                    })?;
                     (canon, 1)
                 }
                 Some(2) => {
                     let val: serde_json::Value = serde_json::from_str(wire.payload.get())
                         .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-                    let canon = serde_json::to_string(&val)
-                        .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
+                    let canon = serde_json::to_string(&val).map_err(|e| {
+                        LedgerError::InvalidInput(format!("cannot serialize payload: {e}"))
+                    })?;
                     (canon, 2)
                 }
                 _ => {

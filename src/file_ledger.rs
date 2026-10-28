@@ -247,7 +247,8 @@ impl FileLedger {
         Self::flock_ex(&file)?;
 
         let append_res = (|| -> Result<Vec<AuditEvent>, LedgerError> {
-            let (mut cur_seq, mut cur_prev_hash, mut last_ts) = match Self::tail_record(&mut file)? {
+            let (mut cur_seq, mut cur_prev_hash, mut last_ts) = match Self::tail_record(&mut file)?
+            {
                 None => (1u64, GENESIS_PREV_HASH.to_string(), None),
                 Some(last_line) => {
                     let last_ev = AuditEvent::from_json_line(&last_line)?;
@@ -479,8 +480,9 @@ impl AuditLedgerReader for FileLedger {
             return Ok(None);
         }
 
-        let mut file = File::open(&self.path)
-            .map_err(|e| LedgerError::LockError(format!("cannot open ledger for get_event: {e}")))?;
+        let mut file = File::open(&self.path).map_err(|e| {
+            LedgerError::LockError(format!("cannot open ledger for get_event: {e}"))
+        })?;
 
         Self::flock_sh(&file)?;
 
