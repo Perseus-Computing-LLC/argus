@@ -23,15 +23,19 @@ fn run(args: &[&str]) -> (i32, serde_json::Value, String) {
         .expect("spawn argus-verify");
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
-    let json: serde_json::Value =
-        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout:?} {stderr:?}"));
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("{e}: {stdout:?} {stderr:?}"));
     (out.status.code().unwrap_or(-1), json, stderr)
 }
 
 fn two_good_events(path: &PathBuf) {
     let ledger = FileLedger::new(path).unwrap();
-    ledger.append("agent.startup", "coordinator", "{\"status\":\"ok\"}").unwrap();
-    ledger.append("tool.exec", "worker_1", "{\"command\":\"test\"}").unwrap();
+    ledger
+        .append("agent.startup", "coordinator", "{\"status\":\"ok\"}")
+        .unwrap();
+    ledger
+        .append("tool.exec", "worker_1", "{\"command\":\"test\"}")
+        .unwrap();
 }
 
 #[test]
@@ -87,7 +91,11 @@ fn record_content_cannot_inject_json_output() {
     let obj = json.as_object().unwrap();
     assert_eq!(obj["valid"], false);
     assert!(obj.get("pwn").is_none());
-    assert_eq!(obj.len(), 4, "exactly valid, first_broken_sequence, error, elapsed_ms: {json}");
+    assert_eq!(
+        obj.len(),
+        4,
+        "exactly valid, first_broken_sequence, error, elapsed_ms: {json}"
+    );
     assert_eq!(obj["first_broken_sequence"], 2);
 }
 
@@ -99,8 +107,16 @@ fn anchor_mismatch_and_missing_file_use_distinct_exit_codes() {
     let (code, json, _) = run(&["--json", "--anchor", &bogus, path.to_str().unwrap()]);
     assert_eq!(code, 1);
     assert_eq!(json["first_broken_sequence"], 2);
-    let (code, json, _) = run(&["--json", "--anchor", &format!("9:{}", "0".repeat(64)), path.to_str().unwrap()]);
-    assert_eq!(code, 1, "an anchor beyond the head means truncation: {json}");
+    let (code, json, _) = run(&[
+        "--json",
+        "--anchor",
+        &format!("9:{}", "0".repeat(64)),
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 1,
+        "an anchor beyond the head means truncation: {json}"
+    );
 
     let missing = path.with_file_name("missing.jsonl");
     let (code, json, _) = run(&["--json", missing.to_str().unwrap()]);

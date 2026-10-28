@@ -1,7 +1,6 @@
-use std::time::Instant;
-use argus_ledger::FileLedger;
-use std::io::{BufRead, BufReader};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::time::Instant;
 
 fn main() {
     println!("Argus Rust Live Ledger Verification Benchmark");
@@ -16,11 +15,9 @@ fn main() {
 
     let reader = BufReader::new(file);
     let mut v2_lines = Vec::new();
-    for line in reader.lines() {
-        if let Ok(l) = line {
-            if l.contains("\"hash_version\":2") || l.contains("\"hash_version\": 2") {
-                v2_lines.push(l);
-            }
+    for l in reader.lines().map_while(Result::ok) {
+        if l.contains("\"hash_version\":2") || l.contains("\"hash_version\": 2") {
+            v2_lines.push(l);
         }
     }
 
@@ -46,9 +43,18 @@ fn main() {
         }
     }
     let elapsed = t0.elapsed();
-    println!("Verified {} / {} v2 event hashes in {:?}", verified_count, v2_lines.len(), elapsed);
+    println!(
+        "Verified {} / {} v2 event hashes in {:?}",
+        verified_count,
+        v2_lines.len(),
+        elapsed
+    );
     if verified_count > 0 {
         let rate = (verified_count as f64) / elapsed.as_secs_f64();
-        println!("Throughput: {:.1} events/sec ({:.2} ms total)", rate, elapsed.as_secs_f64() * 1000.0);
+        println!(
+            "Throughput: {:.1} events/sec ({:.2} ms total)",
+            rate,
+            elapsed.as_secs_f64() * 1000.0
+        );
     }
 }

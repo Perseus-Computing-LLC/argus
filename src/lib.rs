@@ -200,50 +200,60 @@ impl AuditEvent {
     pub fn from_json_line(line: &str) -> Result<Self, LedgerError> {
         let v: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-        let obj = v.as_object()
-            .ok_or_else(|| LedgerError::InvalidInput("event record must be a JSON object".into()))?;
+        let obj = v.as_object().ok_or_else(|| {
+            LedgerError::InvalidInput("event record must be a JSON object".into())
+        })?;
 
-        let sequence = obj.get("sequence")
+        let sequence = obj
+            .get("sequence")
             .and_then(|s| s.as_u64())
             .ok_or_else(|| LedgerError::InvalidInput("missing sequence".into()))?;
 
-        let event_id = obj.get("event_id")
+        let event_id = obj
+            .get("event_id")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing event_id".into()))?
             .to_string();
 
-        let timestamp = obj.get("timestamp")
+        let timestamp = obj
+            .get("timestamp")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing timestamp".into()))?
             .to_string();
 
-        let event_type = obj.get("event_type")
+        let event_type = obj
+            .get("event_type")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing event_type".into()))?
             .to_string();
 
-        let actor = obj.get("actor")
+        let actor = obj
+            .get("actor")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing actor".into()))?
             .to_string();
 
-        let payload_val = obj.get("payload")
+        let payload_val = obj
+            .get("payload")
             .ok_or_else(|| LedgerError::InvalidInput("missing payload".into()))?;
 
         let payload = serde_json::to_string(payload_val)
             .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
 
-        let prev_hash = obj.get("prev_hash")
+        let prev_hash = obj
+            .get("prev_hash")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing prev_hash".into()))?
             .to_string();
 
-        let event_hash = obj.get("event_hash")
+        let event_hash = obj
+            .get("event_hash")
             .and_then(|s| s.as_str())
             .ok_or_else(|| LedgerError::InvalidInput("missing event_hash".into()))?
             .to_string();
 
-        let signature = obj.get("signature")
+        let signature = obj
+            .get("signature")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
 

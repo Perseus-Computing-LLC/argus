@@ -10,10 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
-    hex_lower, sign_event_hash, validate_canonical_payload,
-    validate_identifiers, AuditEvent, AuditLedgerReader, AuditLedgerWriter, AuditVerifier,
-    ChainVerificationReport, LedgerError, VerificationPolicy, GENESIS_PREV_HASH,
-    HASH_VERSION, MAX_PAYLOAD_BYTES,
+    hex_lower, sign_event_hash, validate_canonical_payload, validate_identifiers, AuditEvent,
+    AuditLedgerReader, AuditLedgerWriter, AuditVerifier, ChainVerificationReport, LedgerError,
+    VerificationPolicy, GENESIS_PREV_HASH, HASH_VERSION, MAX_PAYLOAD_BYTES,
 };
 
 #[cfg(unix)]
@@ -81,10 +80,7 @@ impl FileLedger {
             if let Ok(metadata) = file.metadata() {
                 let current_mode = metadata.permissions().mode() & 0o777;
                 if current_mode != 0o600 {
-                    let _ = std::fs::set_permissions(
-                        &path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
                 }
             }
         }
@@ -164,7 +160,9 @@ impl FileLedger {
         let ret = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(LedgerError::LockError(format!("flock LOCK_EX failed: {err}")));
+            return Err(LedgerError::LockError(format!(
+                "flock LOCK_EX failed: {err}"
+            )));
         }
         Ok(())
     }
@@ -175,7 +173,9 @@ impl FileLedger {
         let ret = unsafe { flock(file.as_raw_fd(), LOCK_SH) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(LedgerError::LockError(format!("flock LOCK_SH failed: {err}")));
+            return Err(LedgerError::LockError(format!(
+                "flock LOCK_SH failed: {err}"
+            )));
         }
         Ok(())
     }
@@ -365,8 +365,8 @@ impl AuditLedgerReader for FileLedger {
         let mut events = Vec::new();
 
         for (idx, line_res) in reader.lines().enumerate() {
-            let line = line_res
-                .map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
+            let line =
+                line_res.map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -419,8 +419,9 @@ impl AuditVerifier for FileLedger {
             .enumerate()
             .filter(|(_, line)| !line.trim().is_empty())
             .map(|(idx, line)| {
-                AuditEvent::from_json_line(line.trim())
-                    .map_err(|e| LedgerError::InvalidInput(format!("malformed line {}: {e}", idx + 1)))
+                AuditEvent::from_json_line(line.trim()).map_err(|e| {
+                    LedgerError::InvalidInput(format!("malformed line {}: {e}", idx + 1))
+                })
             });
         let report = policy.verify_stream(records);
         Self::flock_un(&file);

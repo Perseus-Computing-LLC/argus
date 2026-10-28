@@ -12,7 +12,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use argus_ledger::{AuditEvent, ChainAnchor, ChainVerificationReport, LedgerError, VerificationPolicy};
+use argus_ledger::{
+    AuditEvent, ChainAnchor, ChainVerificationReport, LedgerError, VerificationPolicy,
+};
 
 fn print_help() {
     println!(
@@ -79,7 +81,9 @@ fn run_once(path: &Path, policy: &VerificationPolicy) -> Result<ChainVerificatio
         Ok(report) if report.valid => Ok(report),
         Ok(report) => Err(Failure::Integrity(
             report.first_broken_sequence.unwrap_or(0),
-            report.error_detail.unwrap_or_else(|| "verification failed".into()),
+            report
+                .error_detail
+                .unwrap_or_else(|| "verification failed".into()),
         )),
         Err(e) => Err(Failure::Io(e.to_string())),
     }

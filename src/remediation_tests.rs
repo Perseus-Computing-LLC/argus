@@ -634,7 +634,11 @@ fn test_file_ledger_golden_hash_parity_and_cross_compat() {
     );
 
     let ev = ledger
-        .append("tool.exec", "arn:aws:iam::123456789012:user/alice", payload1)
+        .append(
+            "tool.exec",
+            "arn:aws:iam::123456789012:user/alice",
+            payload1,
+        )
         .expect("append");
 
     // Override event_hash computation test against golden hash
@@ -682,7 +686,11 @@ fn rv_f1_every_accepted_identifier_byte_round_trips_through_the_json_line() {
         accepted_actor_bytes += 1;
         let ev = ledger.append("t.e", &actor, "{}").unwrap();
         let line = ev.to_json_line();
-        assert_eq!(AuditEvent::from_json_line(&line).unwrap(), ev, "actor byte {b:#04x}");
+        assert_eq!(
+            AuditEvent::from_json_line(&line).unwrap(),
+            ev,
+            "actor byte {b:#04x}"
+        );
     }
     // 0x21..=0x7e is 94 graphic bytes; minus '"' and '\' leaves 92.
     assert_eq!(accepted_actor_bytes, 92);
@@ -702,7 +710,10 @@ fn rv_f1_actor_with_quote_or_backslash_is_rejected_before_recording() {
     let ledger = InMemoryLedger::new();
     for actor in ["a\"b", "a\\b", "\"", "\\", "a\\\"b"] {
         let result = ledger.append("tool.exec", actor, "{}");
-        assert!(matches!(result, Err(LedgerError::InvalidInput(_))), "{actor:?}");
+        assert!(
+            matches!(result, Err(LedgerError::InvalidInput(_))),
+            "{actor:?}"
+        );
     }
     assert!(ledger.all_events().unwrap().is_empty());
 }
@@ -963,7 +974,15 @@ fn rv_f5_rust_writer_stays_monotonic_after_a_python_written_record() {
         signature: None,
         hash_version: 2,
     };
-    first.event_hash = compute_event_hash(1, "py-1", far_future, "tool.exec", "agent", GENESIS_PREV_HASH, "{}");
+    first.event_hash = compute_event_hash(
+        1,
+        "py-1",
+        far_future,
+        "tool.exec",
+        "agent",
+        GENESIS_PREV_HASH,
+        "{}",
+    );
     std::fs::write(&path, first.to_json_line() + "\n").unwrap();
     let ledger = FileLedger::new(&path).unwrap();
     let second = ledger.append("tool.exec", "agent", "{}").unwrap();

@@ -1,9 +1,16 @@
-use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::time::Instant;
 
-fn compute_v1(seq: u64, id: &str, ts: &str, et: &str, actor: &str, prev: &str, payload_json: &str) -> String {
+fn compute_v1(
+    seq: u64,
+    id: &str,
+    ts: &str,
+    et: &str,
+    actor: &str,
+    prev: &str,
+    payload_json: &str,
+) -> String {
     let header = format!("{seq}:{id}:{ts}:{et}:{actor}:{prev}:");
     let mut input = Vec::with_capacity(header.len() + payload_json.len());
     input.extend_from_slice(header.as_bytes());
@@ -17,11 +24,9 @@ fn main() {
     let reader = BufReader::new(file);
 
     let mut lines = Vec::new();
-    for l in reader.lines() {
-        if let Ok(line) = l {
-            if !line.trim().is_empty() {
-                lines.push(line);
-            }
+    for line in reader.lines().map_while(Result::ok) {
+        if !line.trim().is_empty() {
+            lines.push(line);
         }
     }
     println!("Loaded {} lines from {}", lines.len(), path);
@@ -31,7 +36,7 @@ fn main() {
     let mut v2_verified = 0;
     let mut failed = 0;
 
-    for (idx, line) in lines.iter().enumerate() {
+    for line in lines.iter() {
         let val: serde_json::Value = serde_json::from_str(line).expect("json parse");
         let obj = val.as_object().expect("object");
         let seq = obj.get("sequence").and_then(|v| v.as_u64()).unwrap();
@@ -70,6 +75,13 @@ fn main() {
     let elapsed = t0.elapsed();
     let ms = elapsed.as_secs_f64() * 1000.0;
     let total = v1_verified + v2_verified;
-    println!("Verified {} events (v1: {}, v2: {}, failed: {}) in {:.2} ms ({:.0} ev/s)",
-             total, v1_verified, v2_verified, failed, ms, (total as f64) / elapsed.as_secs_f64());
+    println!(
+        "Verified {} events (v1: {}, v2: {}, failed: {}) in {:.2} ms ({:.0} ev/s)",
+        total,
+        v1_verified,
+        v2_verified,
+        failed,
+        ms,
+        (total as f64) / elapsed.as_secs_f64()
+    );
 }
