@@ -101,6 +101,7 @@ lower than the verify-phase-only figure above because parsing dominates.
 - **Anchoring requirement:** An unanchored chain that is rewritten and re-hashed from genesis is internally consistent. Keep the latest sequence number and hash somewhere the writer cannot change, and verify against it, to detect a complete rewrite.
 - **Storage scope:** The Rust crate provides `InMemoryLedger` and `FileLedger`. The Python package writes a local JSONL file locked with `fcntl`, so it runs on Linux and macOS, not Windows.
 - **Not independently assessed:** No security review or certification has been completed. Designed for local and disconnected use.
+- **`argus_ledger.proofweave` is experimental:** the policy/evidence binding helpers may change or be removed before 1.0. `RAGTriadBinding.to_payload_dict()` emits float scores, which the ledger refuses; convert scores to integers (basis points) before appending.
 
 ## Security
 

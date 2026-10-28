@@ -1,5 +1,12 @@
 """ProofWeave: Contemporaneous Policy-Action-Evidence Binding.
 
+**Experimental.** This module is not part of the ledger's stable surface and may change or be
+removed before 1.0. Known gap: ``RAGTriadBinding`` carries its scores as floats, and
+``AppendOnlyLedger.append`` refuses float payloads since 0.1.0-alpha.7, so
+``RAGTriadBinding.to_payload_dict()`` cannot be appended as is. Convert scores to integers
+(for example basis points, ``int(round(score * 10000))``) before logging. ``PolicyActionBinding``
+produces digest strings only and appends without issue.
+
 Implements record-time cryptographic binding of agent intent, control verdicts, policy snapshots,
 and evidence receipts into Argus audit events, preventing post-hoc reconstruction ambiguity.
 
