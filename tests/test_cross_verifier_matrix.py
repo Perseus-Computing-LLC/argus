@@ -54,7 +54,7 @@ def _argus_verify():
 
 RUNNER_SRC = r'''
 extern crate argus_ledger;
-use argus_ledger::{AuditLedgerWriter, AuditVerifier, FileLedger};
+use argus_ledger::{AuditLedgerWriter, AuditVerifier, FileLedger, VerificationPolicy};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let ledger = FileLedger::new(&args[2]).unwrap();
@@ -64,10 +64,23 @@ fn main() {
             ledger.append("tool.exec", "worker_1", r#"{"command":"test"}"#).unwrap();
             ledger.append("tool.exec", "worker_1", r#"{"max":9007199254740991,"min":-9007199254740991}"#).unwrap();
         }
+        "write10" => {
+            for i in 0..10 {
+                ledger.append("tool.exec", "worker_1", &format!("{{\"step\":{i}}}")).unwrap();
+            }
+        }
+        // "verify" takes an optional third argument: the --legacy-timestamps-before cutoff.
         "verify" => {
-            let r = ledger.verify_chain().unwrap();
+            let policy = VerificationPolicy {
+                legacy_timestamps_before: args.get(3).map(|s| s.parse().unwrap()),
+                ..Default::default()
+            };
+            let r = ledger.verify_chain_with(&policy).unwrap();
             let pos = r.first_broken_sequence.map_or("null".to_string(), |p| p.to_string());
-            println!("{{\"valid\":{},\"first_broken_sequence\":{},\"total_events\":{}}}", r.valid, pos, r.total_events);
+            println!(
+                "{{\"valid\":{},\"first_broken_sequence\":{},\"total_events\":{},\"legacy_timestamp_regressions\":{},\"warnings\":{}}}",
+                r.valid, pos, r.total_events, r.legacy_timestamp_regressions, r.warnings.len()
+            );
         }
         other => panic!("unknown mode {other}"),
     }
@@ -246,6 +259,114 @@ class CrossVerifierMatrixTest(unittest.TestCase):
                     self.assertEqual(verdicts, {name: expected for name in verdicts}, f"{writer_name}/{case_name}: {verdicts}")
                     cells += len(verdicts)
         self.assertEqual(cells, len(writers) * len(verifiers) * len(_cases()))
+
+    # --- issue #14: accept-as-historic timestamp cutoff -------------------------------------
+
+    def _write_python10(self, path):
+        ledger = AppendOnlyLedger(path)
+        for i in range(10):
+            ledger.append("tool.exec", "worker_1", {"step": i})
+
+    def _write_rust10(self, path):
+        subprocess.check_call([self.runner, "write10", path])
+
+    # Each returns (valid, first_broken_sequence, legacy_timestamp_regressions, warning_count).
+
+    def _verify_python_legacy(self, path, cutoff):
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            report = AppendOnlyLedger(path).verify_chain(legacy_timestamps_before=cutoff)
+        self.assertEqual(len(caught), len(report.warnings), [str(w.message) for w in caught])
+        return report.valid, report.first_broken_sequence, report.legacy_timestamp_regressions, len(report.warnings)
+
+    def _verify_rust_lib_legacy(self, path, cutoff):
+        cmd = [self.runner, "verify", path] + ([str(cutoff)] if cutoff is not None else [])
+        out = json.loads(subprocess.check_output(cmd, text=True))
+        return out["valid"], out["first_broken_sequence"], out["legacy_timestamp_regressions"], out["warnings"]
+
+    def _verify_cli_legacy(self, path, cutoff):
+        cmd = [self.cli, "--json"] + (["--legacy-timestamps-before", str(cutoff)] if cutoff is not None else []) + [path]
+        run = subprocess.run(cmd, capture_output=True, text=True)
+        out = json.loads(run.stdout)
+        self.assertEqual(run.returncode, 0 if out["valid"] else 1, run.stdout + run.stderr)
+        # The CLI prints each warning once to stderr as well as in the JSON array.
+        self.assertEqual(run.stderr.count("warning:"), len(out["warnings"]), run.stderr)
+        return out["valid"], out.get("first_broken_sequence"), out.get("legacy_timestamp_regressions", 0), len(out["warnings"])
+
+    def _legacy_verifiers(self):
+        yield "python", self._verify_python_legacy
+        if self.runner:
+            yield "rust_lib", self._verify_rust_lib_legacy
+        if self.cli:
+            yield "argus_verify", self._verify_cli_legacy
+
+    def _ledgers10(self):
+        yield "python", self._write_python10
+        if self.runner:
+            yield "rust", self._write_rust10
+
+    def _write_mutated(self, writer_name, write, case_name, mutate):
+        path = os.path.join(self.dir, f"{writer_name}_legacy_{case_name}.jsonl")
+        if os.path.exists(path):
+            os.remove(path)
+        write(path)
+        with open(path, encoding="utf-8") as fh:
+            records = [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual([r["sequence"] for r in records], list(range(1, 11)))
+        records = mutate(records)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n" for r in records))
+        return path
+
+    def test_legacy_timestamps_before_agrees_across_every_verifier(self):
+        """A clock-step regression at sequence 5 of 10: every verifier fails without the cutoff,
+        passes with cutoff 6 (one regression counted, one warning) and fails again with cutoff 5,
+        because the regression is at the cutoff, where the strict rule applies."""
+        verifiers = list(self._legacy_verifiers())
+        writers = list(self._ledgers10())
+        if len(verifiers) < 3 or len(writers) < 2:
+            _skip_or_fail(self, "Rust toolchain, libargus_ledger.rlib or argus-verify binary missing")
+
+        def regression_at_5(r):
+            r[4]["timestamp"] = r[3]["timestamp"]
+            return _rechain(r, 4)
+
+        def tampered_payload_at_2(r):
+            # No rechain: the content hash at 2 no longer matches, well below the cutoff.
+            regression_at_5(r)
+            r[1]["payload"] = {"step": 99}
+            return r
+
+        expectations = [
+            ("regression_at_5", regression_at_5, None, (False, 5, 0, 0)),
+            ("regression_at_5", regression_at_5, 6, (True, None, 1, 1)),
+            ("regression_at_5", regression_at_5, 5, (False, 5, 0, 0)),
+            ("tampered_payload_at_2", tampered_payload_at_2, 6, (False, 2, 0, 0)),
+        ]
+        cells = 0
+        for writer_name, write in writers:
+            for case_name, mutate, cutoff, expected in expectations:
+                with self.subTest(writer=writer_name, case=case_name, cutoff=cutoff):
+                    path = self._write_mutated(writer_name, write, case_name, mutate)
+                    verdicts = {name: verify(path, cutoff) for name, verify in verifiers}
+                    self.assertEqual(verdicts, {name: expected for name in verdicts}, f"{writer_name}/{case_name}/{cutoff}: {verdicts}")
+                    cells += len(verdicts)
+        self.assertEqual(cells, len(writers) * len(verifiers) * len(expectations))
+
+    def test_legacy_timestamps_before_rejects_zero_everywhere(self):
+        path = os.path.join(self.dir, "python_legacy_zero.jsonl")
+        if os.path.exists(path):
+            os.remove(path)
+        self._write_python10(path)
+        with self.assertRaises(ValueError):
+            AppendOnlyLedger(path).verify_chain(legacy_timestamps_before=0)
+        with self.assertRaises(TypeError):
+            AppendOnlyLedger(path).verify_chain(legacy_timestamps_before="6")
+        if self.cli:
+            run = subprocess.run([self.cli, "--json", "--legacy-timestamps-before", "0", path], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
 
 
 if __name__ == "__main__":

@@ -878,6 +878,7 @@ fn rv_f3_file_ledger_verifies_50k_records_streaming_and_finds_a_fault_at_the_tai
     let policy = VerificationPolicy {
         anchor: Some(anchor),
         verifying_key: None,
+        legacy_timestamps_before: None,
     };
     assert!(ledger.verify_chain_with(&policy).unwrap().valid);
 
@@ -1004,4 +1005,88 @@ fn tempfile_dir(prefix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("argus_test_{}_{}", prefix, nanos));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Issue #14: a ledger written before the strict timestamp rule can carry a clock-step
+/// regression. `legacy_timestamps_before` accepts regressions below the cutoff, counts them and
+/// warns once; everything else (hashes, links, sequence, the rule at or above the cutoff) stays
+/// strict, and `Some(0)` is refused.
+#[test]
+fn issue14_legacy_timestamps_before_accepts_historic_regressions_only_below_the_cutoff() {
+    let ledger = ledger_with(10);
+    let mut events = ledger.all_events().unwrap();
+    // Record 5 is stamped with record 4's instant: not strictly after its predecessor.
+    events[4].timestamp = events[3].timestamp.clone();
+    relink(&mut events);
+
+    let strict = VerificationPolicy::default().verify(&events).unwrap();
+    assert_eq!(strict.first_broken_sequence, Some(5));
+    assert!(matches!(
+        strict.failure,
+        Some(LedgerError::InvalidTimestamp(_))
+    ));
+    assert_eq!(strict.legacy_timestamp_regressions, 0);
+    assert!(strict.warnings.is_empty());
+
+    let with_cutoff = |cutoff: u64| {
+        VerificationPolicy {
+            legacy_timestamps_before: Some(cutoff),
+            ..Default::default()
+        }
+        .verify(&events)
+    };
+
+    let historic = with_cutoff(6).unwrap();
+    assert!(historic.valid, "{:?}", historic.error_detail);
+    assert_eq!(historic.total_events, 10);
+    assert_eq!(historic.legacy_timestamp_regressions, 1);
+    assert_eq!(historic.warnings.len(), 1);
+    assert!(
+        historic.warnings[0].contains("first at sequence 5"),
+        "{:?}",
+        historic.warnings
+    );
+
+    // The regression sits at the cutoff, so the strict rule applies to it.
+    let at_cutoff = with_cutoff(5).unwrap();
+    assert_eq!(at_cutoff.first_broken_sequence, Some(5));
+    assert!(matches!(
+        at_cutoff.failure,
+        Some(LedgerError::InvalidTimestamp(_))
+    ));
+
+    // Sequence numbers start at 1; a cutoff of 0 is a caller error, not "unset".
+    assert!(matches!(with_cutoff(0), Err(LedgerError::InvalidInput(_))));
+
+    // Hash tampering below the cutoff is still a failure: the option relaxes timestamp order
+    // only. The chain breaks at 2, before the regression is reached, so nothing is counted.
+    let mut tampered = events.clone();
+    tampered[1].payload = "{\"step\":99}".into();
+    let report = with_cutoff(6).unwrap_or_else(|e| panic!("{e}"));
+    assert!(report.valid);
+    let report = VerificationPolicy {
+        legacy_timestamps_before: Some(6),
+        ..Default::default()
+    }
+    .verify(&tampered)
+    .unwrap();
+    assert_eq!(report.first_broken_sequence, Some(2));
+    assert!(matches!(report.failure, Some(LedgerError::HashMismatch(_))));
+    assert_eq!(report.legacy_timestamp_regressions, 0);
+
+    // A malformed timestamp below the cutoff is still a failure.
+    let mut malformed = events.clone();
+    malformed[2].timestamp = "not-a-time".into();
+    relink(&mut malformed);
+    let report = VerificationPolicy {
+        legacy_timestamps_before: Some(6),
+        ..Default::default()
+    }
+    .verify(&malformed)
+    .unwrap();
+    assert_eq!(report.first_broken_sequence, Some(3));
+    assert!(matches!(
+        report.failure,
+        Some(LedgerError::InvalidTimestamp(_))
+    ));
 }

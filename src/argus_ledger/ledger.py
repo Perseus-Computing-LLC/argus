@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import uuid
+import warnings
 from typing import Any, Dict, Iterator, Optional
 from .hasher import (
     compute_event_hash,
@@ -295,7 +296,11 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     "open it with verify_key=<Ed25519 public key> to check Ed25519 signatures")
         return f"Missing or invalid signature at sequence {position}"
 
-    def verify_chain(self, anchor: Optional[ChainAnchor] = None) -> ChainVerificationReport:
+    def verify_chain(
+        self,
+        anchor: Optional[ChainAnchor] = None,
+        legacy_timestamps_before: Optional[int] = None,
+    ) -> ChainVerificationReport:
         """Verify sequence numbers, hash links, event hashes, timestamp order and, with a key,
         signatures, in one pass over the file with one record resident at a time.
 
@@ -305,7 +310,24 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         also detects rollback, truncation below the anchor and rewritten history up to it.
         ``first_broken_sequence`` is the chain position, never a value read from the record.
         On failure ``total_events`` is the number of records read up to and including the
-        broken one; the rest of the file is not read."""
+        broken one; the rest of the file is not read.
+
+        ``legacy_timestamps_before`` is the accept-as-historic cutoff (issue #14). Ledgers written
+        before the strictly-increasing timestamp rule can hold records whose timestamp is not after
+        their predecessor's (a host clock stepping backwards). With this set to a sequence ``>= 1``,
+        such a regression at a sequence below the cutoff is counted in
+        ``report.legacy_timestamp_regressions`` and reported once as a ``UserWarning`` and in
+        ``report.warnings`` instead of failing the chain. Hashes, ``prev_hash`` links, sequence
+        continuity, malformed timestamps and malformed lines stay strict everywhere, and the strict
+        timestamp rule applies from the cutoff onwards. The Rust library and ``argus-verify
+        --legacy-timestamps-before`` apply the same rule."""
+        if legacy_timestamps_before is not None:
+            # Sequence numbers start at 1, so 0 (or a bool, which int accepts) is a caller mistake;
+            # refuse it rather than silently behaving as if the option were unset.
+            if isinstance(legacy_timestamps_before, bool) or not isinstance(legacy_timestamps_before, int):
+                raise TypeError("legacy_timestamps_before must be an int >= 1 or None")
+            if legacy_timestamps_before < 1:
+                raise ValueError("legacy_timestamps_before must be >= 1")
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         anchored = anchor is not None
 
@@ -314,9 +336,25 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         root_hash = ""
         head_hash = ""
         legacy_events = 0
+        legacy_timestamp_regressions = 0
+        first_legacy_regression: Optional[int] = None
         expected_prev = GENESIS_PREV_HASH
         prev_instant: Optional[int] = None
         anchor_matched = False
+
+        def warning_lines(stacklevel: int) -> list:
+            # One warning for the whole pass, not one per record: a historic ledger can hold
+            # dozens, and the count plus the first position is what decides whether the cutoff
+            # is right. Emitted when the report is built so it also fires on a later failure;
+            # ``stacklevel`` points the warning at verify_chain's caller from either path.
+            if first_legacy_regression is None:
+                return []
+            text = (
+                f"{legacy_timestamp_regressions} timestamp regression(s) accepted as historic below "
+                f"sequence {legacy_timestamps_before} (first at sequence {first_legacy_regression})"
+            )
+            warnings.warn(text, UserWarning, stacklevel=stacklevel)
+            return [text]
 
         def broken(at: int, detail: str) -> ChainVerificationReport:
             return ChainVerificationReport(
@@ -328,6 +366,8 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                 error_detail=detail,
                 checked_at=now_ts,
                 legacy_events=legacy_events,
+                legacy_timestamp_regressions=legacy_timestamp_regressions,
+                warnings=warning_lines(stacklevel=4),
                 anchored=anchored,
             )
 
@@ -358,9 +398,19 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
 
             # Timestamp contract (shared with the Rust crate and argus-verify): strictly
             # increasing as instants, so a replayed or back-dated record cannot be spliced in.
+            # A timestamp that does not parse always fails. One that is not strictly after its
+            # predecessor fails unless the record lies below the accept-as-historic cutoff
+            # (issue #14), in which case it is counted and reported once.
             instant = timestamp_nanos(event.timestamp)
-            if instant is None or (prev_instant is not None and instant <= prev_instant):
+            if instant is None:
                 return broken(idx, f"Timestamp at sequence {idx} is malformed or not increasing")
+            if prev_instant is not None and instant <= prev_instant:
+                historic = legacy_timestamps_before is not None and idx < legacy_timestamps_before
+                if not historic:
+                    return broken(idx, f"Timestamp at sequence {idx} is malformed or not increasing")
+                legacy_timestamp_regressions += 1
+                if first_legacy_regression is None:
+                    first_legacy_regression = idx
 
             if self._signed and not self._signature_valid(event):
                 return broken(idx, self._signature_error(event, idx))
@@ -388,5 +438,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             head_hash=head_hash,
             checked_at=now_ts,
             legacy_events=legacy_events,
+            legacy_timestamp_regressions=legacy_timestamp_regressions,
+            warnings=warning_lines(stacklevel=3),
             anchored=anchored,
         )
