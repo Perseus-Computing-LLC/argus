@@ -44,7 +44,7 @@ class IdentifierGrammarTest(unittest.TestCase):
 
     def test_every_byte_the_grammar_accepts_matches_the_rust_rule(self):
         # Rust: event_type bytes [a-z0-9_-] plus '.' as separator; actor bytes 0x21..=0x7e
-        # minus '"' and '\\'. 92 actor bytes, 38 event_type bytes.
+        # minus '"' and '\\'. 92 actor bytes; 26 + 10 + "_-." = 39 event_type bytes.
         accepted_actor = [b for b in range(0x80) if _ok(lambda: validate_identifiers("t.e", f"x{chr(b)}y"))]
         accepted_type = [b for b in range(0x80) if _ok(lambda: validate_identifiers(f"a{chr(b)}b", "w"))]
         self.assertEqual(len(accepted_actor), 92)
