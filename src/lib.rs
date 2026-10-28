@@ -144,6 +144,8 @@ pub struct VerificationPolicy {
     /// If set, the chain must contain this event unchanged. Detects rollback, truncation below
     /// the anchor, and recomputed history; events appended after it remain unwitnessed.
     pub anchor: Option<ChainAnchor>,
+    /// If set, every anchor checkpoint in this list must be witnessed by the chain.
+    pub anchors: Vec<ChainAnchor>,
     /// If set, every event must carry a valid signature by this key; missing, stripped, or
     /// foreign signatures fail verification.
     pub verifying_key: Option<ed25519_dalek::VerifyingKey>,
@@ -210,74 +212,57 @@ impl AuditEvent {
         .expect("Wire holds only integers and strings; serialization cannot fail")
     }
 
-    /// Parse an event from a JSON line, extracting canonical payload.
+    /// Parse an event from a JSON line, extracting canonical payload directly from raw bytes.
     pub fn from_json_line(line: &str) -> Result<Self, LedgerError> {
-        let v: serde_json::Value = serde_json::from_str(line)
+        #[derive(serde::Deserialize)]
+        struct WireRef<'a> {
+            sequence: u64,
+            #[serde(borrow)]
+            event_id: std::borrow::Cow<'a, str>,
+            #[serde(borrow)]
+            timestamp: std::borrow::Cow<'a, str>,
+            #[serde(borrow)]
+            event_type: std::borrow::Cow<'a, str>,
+            #[serde(borrow)]
+            actor: std::borrow::Cow<'a, str>,
+            #[serde(borrow)]
+            payload: &'a serde_json::value::RawValue,
+            #[serde(borrow)]
+            prev_hash: std::borrow::Cow<'a, str>,
+            #[serde(borrow)]
+            event_hash: std::borrow::Cow<'a, str>,
+            #[serde(default, borrow)]
+            signature: Option<std::borrow::Cow<'a, str>>,
+            #[serde(default)]
+            hash_version: Option<serde_json::Value>,
+        }
+
+        let wire: WireRef = serde_json::from_str(line)
             .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-        let obj = v.as_object().ok_or_else(|| {
-            LedgerError::InvalidInput("event record must be a JSON object".into())
-        })?;
 
-        let sequence = obj
-            .get("sequence")
-            .and_then(|s| s.as_u64())
-            .ok_or_else(|| LedgerError::InvalidInput("missing sequence".into()))?;
-
-        let event_id = obj
-            .get("event_id")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| LedgerError::InvalidInput("missing event_id".into()))?
-            .to_string();
-
-        let timestamp = obj
-            .get("timestamp")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| LedgerError::InvalidInput("missing timestamp".into()))?
-            .to_string();
-
-        let event_type = obj
-            .get("event_type")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| LedgerError::InvalidInput("missing event_type".into()))?
-            .to_string();
-
-        let actor = obj
-            .get("actor")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| LedgerError::InvalidInput("missing actor".into()))?
-            .to_string();
-
-        let payload_val = obj
-            .get("payload")
-            .ok_or_else(|| LedgerError::InvalidInput("missing payload".into()))?;
-
-        let payload = serde_json::to_string(payload_val)
-            .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
-
-        let prev_hash = obj
-            .get("prev_hash")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| LedgerError::InvalidInput("missing prev_hash".into()))?
-            .to_string();
-
-        let event_hash = obj
-            .get("event_hash")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| LedgerError::InvalidInput("missing event_hash".into()))?
-            .to_string();
-
-        let signature = obj
-            .get("signature")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
-
-        // Absent means a record written before the field existed (format 1), as in the Python
-        // model. Any other value is a record this crate cannot verify, so it must not parse.
-        let hash_version = match obj.get("hash_version") {
-            None => 1,
+        let (payload, hash_version) = match &wire.hash_version {
+            None => {
+                let v: serde_json::Value = serde_json::from_str(wire.payload.get())
+                    .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
+                let canon = serde_json::to_string(&v)
+                    .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
+                (canon, 1)
+            }
             Some(v) => match v.as_u64() {
-                Some(1) => 1,
-                Some(2) => 2,
+                Some(1) => {
+                    let val: serde_json::Value = serde_json::from_str(wire.payload.get())
+                        .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
+                    let canon = serde_json::to_string(&val)
+                        .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
+                    (canon, 1)
+                }
+                Some(2) => {
+                    let val: serde_json::Value = serde_json::from_str(wire.payload.get())
+                        .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
+                    let canon = serde_json::to_string(&val)
+                        .map_err(|e| LedgerError::InvalidInput(format!("cannot serialize payload: {e}")))?;
+                    (canon, 2)
+                }
                 _ => {
                     let detail = format!("unsupported hash_version {v}");
                     return Err(LedgerError::InvalidInput(detail));
@@ -286,15 +271,15 @@ impl AuditEvent {
         };
 
         Ok(Self {
-            sequence,
-            event_id,
-            timestamp,
-            event_type,
-            actor,
+            sequence: wire.sequence,
+            event_id: wire.event_id.to_string(),
+            timestamp: wire.timestamp.to_string(),
+            event_type: wire.event_type.to_string(),
+            actor: wire.actor.to_string(),
             payload,
-            prev_hash,
-            event_hash,
-            signature,
+            prev_hash: wire.prev_hash.to_string(),
+            event_hash: wire.event_hash.to_string(),
+            signature: wire.signature.map(|s| s.to_string()),
             hash_version,
         })
     }
@@ -948,6 +933,7 @@ pub struct ChainVerifier<'a> {
     root_hash: String,
     head_hash: String,
     anchor_matched: bool,
+    anchors_matched: std::collections::HashSet<u64>,
     checked_at: String,
 }
 
@@ -968,6 +954,7 @@ impl<'a> ChainVerifier<'a> {
             root_hash: String::new(),
             head_hash: String::new(),
             anchor_matched: false,
+            anchors_matched: std::collections::HashSet::new(),
             checked_at: format!("{now_sec}"),
         }
     }
@@ -1071,6 +1058,15 @@ impl<'a> ChainVerifier<'a> {
                 self.anchor_matched = true;
             }
         }
+        for anchor in &self.policy.anchors {
+            if anchor.sequence == seq {
+                if anchor.event_hash != event.event_hash {
+                    let detail = format!("chain does not contain anchored event {seq}");
+                    return Some(self.report(seq, LedgerError::HashMismatch(detail)));
+                }
+                self.anchors_matched.insert(seq);
+            }
+        }
         self.legacy_events += usize::from(event.hash_version == 1);
         self.prev_timestamp = Some(timestamp);
         if seq == 1 {
@@ -1086,6 +1082,12 @@ impl<'a> ChainVerifier<'a> {
     pub fn finish(self) -> ChainVerificationReport {
         if let Some(anchor) = &self.policy.anchor {
             if !self.anchor_matched {
+                let detail = format!("chain does not contain anchored event {}", anchor.sequence);
+                return self.report(anchor.sequence, LedgerError::HashMismatch(detail));
+            }
+        }
+        for anchor in &self.policy.anchors {
+            if !self.anchors_matched.contains(&anchor.sequence) {
                 let detail = format!("chain does not contain anchored event {}", anchor.sequence);
                 return self.report(anchor.sequence, LedgerError::HashMismatch(detail));
             }

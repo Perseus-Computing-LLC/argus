@@ -879,6 +879,7 @@ fn rv_f3_file_ledger_verifies_50k_records_streaming_and_finds_a_fault_at_the_tai
         anchor: Some(anchor),
         verifying_key: None,
         legacy_timestamps_before: None,
+        ..Default::default()
     };
     assert!(ledger.verify_chain_with(&policy).unwrap().valid);
 
@@ -1126,3 +1127,5 @@ fn gd_append_batch_and_sparse_index_and_canonical_bytes() {
     let parsed = AuditEvent::from_json_line(raw_line).expect("from_json_line should succeed");
     assert!(parsed.payload.contains("123456789012345678901234567890"), "canonical payload preserved without float rounding: {}", parsed.payload);
 }
+
+
