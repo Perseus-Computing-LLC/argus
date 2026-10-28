@@ -201,7 +201,6 @@ fn anchor_mismatch_and_missing_file_use_distinct_exit_codes() {
     assert_eq!(json["valid"], false);
 }
 
-
 /// G-R1: Tracekit tail-cut reproduction and --anchor-file verification.
 /// Without an anchor, a truncated chain (events 8..10 deleted) passes internal verification.
 /// With an --anchor-file witnessing sequence 10, the tail-cut fails closed (exit 1).
@@ -211,7 +210,9 @@ fn tracekit_tail_cut_detected_by_anchor_file() {
     let ledger = FileLedger::new(&path).unwrap();
     let mut head_hashes = Vec::new();
     for i in 1..=10 {
-        let ev = ledger.append("task.event", "worker", &format!("{{\"step\":{i}}}")).unwrap();
+        let ev = ledger
+            .append("task.event", "worker", &format!("{{\"step\":{i}}}"))
+            .unwrap();
         head_hashes.push((ev.sequence, ev.event_hash.clone(), ev.timestamp.clone()));
     }
     let (seq10, hash10, ts10) = &head_hashes[9];
@@ -231,7 +232,12 @@ fn tracekit_tail_cut_detected_by_anchor_file() {
     std::fs::write(&anchor_file, checkpoint.to_string()).unwrap();
 
     // 1. Intact ledger with anchor file passes.
-    let (code, json, stderr) = run(&["--json", "--anchor-file", anchor_file.to_str().unwrap(), path.to_str().unwrap()]);
+    let (code, json, stderr) = run(&[
+        "--json",
+        "--anchor-file",
+        anchor_file.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
     assert_eq!(code, 0, "intact ledger must pass: {json} {stderr}");
     assert_eq!(json["valid"], true);
     assert_eq!(json["total_events"], 10);
@@ -244,7 +250,10 @@ fn tracekit_tail_cut_detected_by_anchor_file() {
 
     // Tracekit property: WITHOUT anchor, truncated log passes internal checks.
     let (code_no_anchor, json_no_anchor, _) = run(&["--json", truncated_path.to_str().unwrap()]);
-    assert_eq!(code_no_anchor, 0, "truncated chain internally valid without anchor");
+    assert_eq!(
+        code_no_anchor, 0,
+        "truncated chain internally valid without anchor"
+    );
     assert_eq!(json_no_anchor["valid"], true);
     assert_eq!(json_no_anchor["total_events"], 7);
 
@@ -255,7 +264,10 @@ fn tracekit_tail_cut_detected_by_anchor_file() {
         anchor_file.to_str().unwrap(),
         truncated_path.to_str().unwrap(),
     ]);
-    assert_eq!(code_anchored, 1, "tail-cut must fail verification: {json_anchored} {stderr_anchored}");
+    assert_eq!(
+        code_anchored, 1,
+        "tail-cut must fail verification: {json_anchored} {stderr_anchored}"
+    );
     assert_eq!(json_anchored["valid"], false);
     assert_eq!(json_anchored["first_broken_sequence"], 10);
 
