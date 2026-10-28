@@ -4,7 +4,8 @@
 //! [`argus_ledger::AuditEvent::from_json_line`] and the chain is checked by
 //! [`argus_ledger::VerificationPolicy::verify_stream`], so the CLI, `FileLedger::verify_chain` and the
 //! Python package apply one set of rules (hash formats 1 and 2, prev_hash links, sequence
-//! continuity, strictly increasing timestamps, anchors). It fails closed: a non-blank line that
+//! continuity, strictly increasing timestamps unless `--legacy-timestamps-before` accepts
+//! older regressions as historic, anchors). It fails closed: a non-blank line that
 //! is not a complete record is an integrity failure at that file position.
 
 use std::fs::File;
@@ -28,6 +29,12 @@ ARGS:
 
 OPTIONS:
     --anchor <SEQ>:<HASH>   Verify the chain witnesses a known sequence and event hash
+    --legacy-timestamps-before <SEQ>
+                            Accept-as-historic: below sequence SEQ (>= 1), a timestamp that is
+                            not strictly after its predecessor's is counted and warned about
+                            instead of failing the chain. Hashes, links, sequence continuity
+                            and malformed records stay strict; the strict timestamp rule
+                            applies from SEQ onwards. For ledgers written before that rule.
     --benchmark, -b         Run 5 iterations (open, parse and verify) and report the median
     --json                  Output results in structured machine-readable JSON
     --help, -h              Print this help text
@@ -44,8 +51,9 @@ EXIT CODES:
 
 /// Why one pass did not end in a valid chain.
 enum Failure {
-    /// Integrity verdict: exit 1, reported at a chain position.
-    Integrity(u64, String),
+    /// Integrity verdict: exit 1, reported at a chain position, with any warnings collected
+    /// before the break (accepted historic regressions are still worth telling the operator).
+    Integrity(u64, String, Vec<String>),
     /// The file could not be read: exit 2, no verdict.
     Io(String),
 }
@@ -84,6 +92,7 @@ fn run_once(path: &Path, policy: &VerificationPolicy) -> Result<ChainVerificatio
             report
                 .error_detail
                 .unwrap_or_else(|| "verification failed".into()),
+            report.warnings,
         )),
         Err(e) => Err(Failure::Io(e.to_string())),
     }
@@ -104,14 +113,30 @@ fn ms(d: std::time::Duration) -> f64 {
     (d.as_secs_f64() * 1000.0 * 100.0).round() / 100.0
 }
 
+/// Warnings go to stderr in both modes so a JSON consumer reading stdout sees them in the
+/// `warnings` array and a human watching the terminal sees them regardless of the verdict.
+fn emit_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
 /// Record content (hashes, error text) is emitted through serde_json only: hand-built JSON let
 /// a crafted `prev_hash` inject `"valid":true` into the machine-readable output.
-fn emit_failure(json_mode: bool, position: u64, error: &str, elapsed: std::time::Duration) {
+fn emit_failure(
+    json_mode: bool,
+    position: u64,
+    error: &str,
+    warnings: &[String],
+    elapsed: std::time::Duration,
+) {
+    emit_warnings(warnings);
     if json_mode {
         let out = serde_json::json!({
             "valid": false,
             "first_broken_sequence": position,
             "error": error,
+            "warnings": warnings,
             "elapsed_ms": ms(elapsed),
         });
         println!("{out}");
@@ -137,12 +162,15 @@ fn emit_success(
     } else {
         0.0
     };
+    emit_warnings(&report.warnings);
     if json_mode {
         let out = serde_json::json!({
             "valid": true,
             "total_events": total,
             "v1_legacy_events": v1,
             "v2_events": v2,
+            "legacy_timestamp_regressions": report.legacy_timestamp_regressions,
+            "warnings": report.warnings,
             "root_hash": report.root_hash,
             "head_hash": report.head_hash,
             "elapsed_ms": ms(elapsed),
@@ -154,6 +182,12 @@ fn emit_success(
         println!("  Total events:  {total}");
         println!("  Format v1:     {v1} (legacy pre-20261015)");
         println!("  Format v2:     {v2} (active domain-separated)");
+        if report.legacy_timestamp_regressions > 0 {
+            println!(
+                "  Historic timestamp regressions accepted: {}",
+                report.legacy_timestamp_regressions
+            );
+        }
         println!("  Root hash:     {}", report.root_hash);
         println!("  Head hash:     {}", report.head_hash);
         println!(
@@ -173,6 +207,7 @@ fn main() {
     let mut json_mode = false;
     let mut benchmark_mode = false;
     let mut anchor: Option<ChainAnchor> = None;
+    let mut legacy_timestamps_before: Option<u64> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -190,6 +225,21 @@ fn main() {
             }
             "--benchmark" | "-b" => {
                 benchmark_mode = true;
+            }
+            "--legacy-timestamps-before" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --legacy-timestamps-before requires <SEQ>");
+                    std::process::exit(2);
+                }
+                // Sequence numbers start at 1; 0 would silently mean "unset", so refuse it.
+                match args[i].parse::<u64>() {
+                    Ok(seq) if seq >= 1 => legacy_timestamps_before = Some(seq),
+                    _ => {
+                        eprintln!("Error: --legacy-timestamps-before must be an integer >= 1");
+                        std::process::exit(2);
+                    }
+                }
             }
             "--anchor" => {
                 i += 1;
@@ -249,6 +299,7 @@ fn main() {
     let policy = VerificationPolicy {
         anchor: anchor.clone(),
         verifying_key: None,
+        legacy_timestamps_before,
     };
 
     if benchmark_mode {
@@ -307,8 +358,8 @@ fn main() {
             emit_success(json_mode, &report, anchor.as_ref(), elapsed);
             std::process::exit(0);
         }
-        Err(Failure::Integrity(position, error)) => {
-            emit_failure(json_mode, position, &error, elapsed);
+        Err(Failure::Integrity(position, error, warnings)) => {
+            emit_failure(json_mode, position, &error, &warnings, elapsed);
             std::process::exit(1);
         }
         Err(Failure::Io(detail)) => exit_io(json_mode, &detail),

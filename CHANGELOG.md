@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Repair set from the 2026-10-28 review. Finding ids refer to that review. No version bump.
 
+### Added
+- **#14:** accept-as-historic timestamp cutoff for ledgers written before the strictly-increasing
+  timestamp rule (F5). `argus-verify --legacy-timestamps-before <seq>`, Python
+  `verify_chain(legacy_timestamps_before=seq)` and Rust
+  `VerificationPolicy::legacy_timestamps_before: Option<u64>` apply one rule: below `seq`, a
+  timestamp that is not strictly after its predecessor's is counted in the report's
+  `legacy_timestamp_regressions` and reported once (report `warnings`; CLI `warnings` JSON array
+  and one stderr line; Python `UserWarning`) instead of failing the chain. Hashes, `prev_hash`
+  links, sequence continuity, malformed timestamps and malformed lines stay strict, and the
+  strict rule applies from `seq` onwards. `seq` must be at least 1; unset, behaviour is unchanged.
+  The cross-language matrix test covers a regression at sequence 5 of 10 under no cutoff, cutoff
+  6 and cutoff 5, and hash tampering below the cutoff, across every writer and verifier.
+  `argus-verify --json` output now always carries `warnings` (and `legacy_timestamp_regressions`
+  on success).
+
 ### Fixed
 - **F1 (critical):** Rust `AuditEvent::to_json_line` built the record line with `format!`, so an
   actor containing `"` or `\` (both ASCII-graphic, so accepted by `validate_identifiers`) produced

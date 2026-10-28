@@ -62,7 +62,13 @@ class AuditLedgerReader(Protocol):
 class AuditVerifier(Protocol):
     """Verifier interface for validating hash chain continuity."""
 
-    def verify_chain(self, anchor: Optional[ChainAnchor] = None) -> ChainVerificationReport:
+    def verify_chain(
+        self,
+        anchor: Optional[ChainAnchor] = None,
+        legacy_timestamps_before: Optional[int] = None,
+    ) -> ChainVerificationReport:
         """Traverse the entire ledger and verify SHA-256 hash continuity and integrity. Without an
-        anchor (an externally kept ``AuditEvent.anchor()``) this proves internal consistency only."""
+        anchor (an externally kept ``AuditEvent.anchor()``) this proves internal consistency only.
+        ``legacy_timestamps_before`` accepts timestamp regressions below that sequence as historic
+        (issue #14); see ``AppendOnlyLedger.verify_chain``."""
         ...

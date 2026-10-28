@@ -119,6 +119,12 @@ pub struct ChainVerificationReport {
     pub checked_at: String,
     /// Events verified under hash format 1, whose field boundaries are not bound into the hash.
     pub legacy_events: usize,
+    /// Records below `VerificationPolicy::legacy_timestamps_before` whose timestamp was not
+    /// strictly after their predecessor's. Zero unless that option is set.
+    pub legacy_timestamp_regressions: usize,
+    /// Non-fatal findings. At most one entry today: the count of accepted timestamp
+    /// regressions and the first sequence at which one occurred.
+    pub warnings: Vec<String>,
 }
 
 /// Externally witnessed commitment to one chain position, such as a head published to a
@@ -141,6 +147,14 @@ pub struct VerificationPolicy {
     /// If set, every event must carry a valid signature by this key; missing, stripped, or
     /// foreign signatures fail verification.
     pub verifying_key: Option<ed25519_dalek::VerifyingKey>,
+    /// Accept-as-historic cutoff (issue #14). Ledgers written before the strictly-increasing
+    /// timestamp rule can hold records whose timestamp is not after their predecessor's (a
+    /// host clock stepping backwards). With this set, such a regression at a sequence below the
+    /// cutoff is counted in `ChainVerificationReport::legacy_timestamp_regressions` and reported
+    /// as a warning instead of failing the chain. Hashes, `prev_hash` links, sequence continuity,
+    /// malformed timestamps and malformed lines stay strict everywhere, and the strict timestamp
+    /// rule applies from the cutoff onwards. Must be `>= 1`; `None` leaves behaviour unchanged.
+    pub legacy_timestamps_before: Option<u64>,
 }
 
 impl AuditEvent {
@@ -898,6 +912,13 @@ impl VerificationPolicy {
     where
         I: IntoIterator<Item = Result<AuditEvent, LedgerError>>,
     {
+        // Sequence numbers start at 1, so a cutoff of 0 can only be a caller mistake; refuse it
+        // rather than silently behaving as if the option were unset.
+        if self.legacy_timestamps_before == Some(0) {
+            return Err(LedgerError::InvalidInput(
+                "legacy_timestamps_before must be >= 1".into(),
+            ));
+        }
         let mut verifier = ChainVerifier::new(self);
         for record in records {
             match record {
@@ -922,6 +943,8 @@ pub struct ChainVerifier<'a> {
     expected_prev: String,
     prev_timestamp: Option<u64>,
     legacy_events: usize,
+    legacy_timestamp_regressions: usize,
+    first_legacy_regression: Option<u64>,
     root_hash: String,
     head_hash: String,
     anchor_matched: bool,
@@ -940,6 +963,8 @@ impl<'a> ChainVerifier<'a> {
             expected_prev: GENESIS_PREV_HASH.to_string(),
             prev_timestamp: None,
             legacy_events: 0,
+            legacy_timestamp_regressions: 0,
+            first_legacy_regression: None,
             root_hash: String::new(),
             head_hash: String::new(),
             anchor_matched: false,
@@ -950,6 +975,20 @@ impl<'a> ChainVerifier<'a> {
     /// Records examined so far.
     pub fn position(&self) -> u64 {
         self.position
+    }
+
+    /// The single warning for accepted timestamp regressions, if any were counted. One line
+    /// rather than one per record: a historic ledger can hold dozens and the count plus the
+    /// first position is what an operator needs to decide whether the cutoff is right.
+    fn warnings(&self) -> Vec<String> {
+        match self.first_legacy_regression {
+            Some(first) => vec![format!(
+                "{} timestamp regression(s) accepted as historic below sequence {} (first at sequence {first})",
+                self.legacy_timestamp_regressions,
+                self.policy.legacy_timestamps_before.unwrap_or(0),
+            )],
+            None => Vec::new(),
+        }
     }
 
     /// `position` is computed by the verifier, never read from the record under test.
@@ -964,6 +1003,8 @@ impl<'a> ChainVerifier<'a> {
             failure: Some(error),
             checked_at: self.checked_at.clone(),
             legacy_events: self.legacy_events,
+            legacy_timestamp_regressions: self.legacy_timestamp_regressions,
+            warnings: self.warnings(),
         }
     }
 
@@ -993,12 +1034,25 @@ impl<'a> ChainVerifier<'a> {
             let detail = format!("tampered content hash at sequence {seq}");
             return Some(self.report(seq, LedgerError::HashMismatch(detail)));
         }
-        let Some(timestamp) = parse_timestamp_nanos(&event.timestamp)
-            .filter(|&ns| self.prev_timestamp.is_none_or(|prev| ns > prev))
-        else {
+        // A timestamp that does not parse is always a failure. One that parses but is not
+        // strictly after its predecessor is a failure unless the record lies below the
+        // accept-as-historic cutoff (issue #14), in which case it is counted and reported once.
+        let Some(timestamp) = parse_timestamp_nanos(&event.timestamp) else {
             let detail = format!("timestamp at sequence {seq} is malformed or not increasing");
             return Some(self.report(seq, LedgerError::InvalidTimestamp(detail)));
         };
+        if self.prev_timestamp.is_some_and(|prev| timestamp <= prev) {
+            let historic = self
+                .policy
+                .legacy_timestamps_before
+                .is_some_and(|cutoff| seq < cutoff);
+            if !historic {
+                let detail = format!("timestamp at sequence {seq} is malformed or not increasing");
+                return Some(self.report(seq, LedgerError::InvalidTimestamp(detail)));
+            }
+            self.legacy_timestamp_regressions += 1;
+            self.first_legacy_regression.get_or_insert(seq);
+        }
         if let Some(key) = &self.policy.verifying_key {
             let signed = event.signature.as_deref().is_some_and(|signature| {
                 verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
@@ -1039,6 +1093,7 @@ impl<'a> ChainVerifier<'a> {
         ChainVerificationReport {
             valid: true,
             total_events: self.position as usize,
+            warnings: self.warnings(),
             root_hash: self.root_hash,
             head_hash: self.head_hash,
             first_broken_sequence: None,
@@ -1046,6 +1101,7 @@ impl<'a> ChainVerifier<'a> {
             failure: None,
             checked_at: self.checked_at,
             legacy_events: self.legacy_events,
+            legacy_timestamp_regressions: self.legacy_timestamp_regressions,
         }
     }
 }

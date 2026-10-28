@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 GENESIS_PREV_HASH = "0" * 64
@@ -59,6 +59,21 @@ class ChainVerificationReport(BaseModel):
         default=0,
         ge=0,
         description="Events verified under hash format 1, whose field boundaries are not bound into the hash.",
+    )
+    legacy_timestamp_regressions: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Records below verify_chain(legacy_timestamps_before=...) whose timestamp was not strictly "
+            "after their predecessor's. Zero unless that option is set."
+        ),
+    )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-fatal findings. At most one entry today: the count of accepted timestamp regressions "
+            "and the first sequence at which one occurred."
+        ),
     )
     anchored: bool = Field(
         default=False,
