@@ -31,6 +31,6 @@ Repository = "https://github.com/Perseus-Computing-LLC/argus"
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 testpaths = ["tests"]
 

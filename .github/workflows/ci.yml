@@ -84,6 +84,18 @@ jobs:
           cargo build --locked
           cargo build --locked --release
 
+      # The native-verifier tests (tests/test_native_verifier.py, the python_native column of the
+      # matrix) need the argus_ledger_native extension importable. Built as a wheel from
+      # bindings/python and installed into the test interpreter; under CI=true a missing
+      # extension fails those tests instead of skipping them.
+      - name: Build and install the argus_ledger_native extension
+        shell: bash
+        run: |
+          pip install maturin
+          (cd bindings/python && maturin build --release --locked --out "$RUNNER_TEMP/native-wheel")
+          pip install "$RUNNER_TEMP"/native-wheel/*.whl
+          python -c "import argus_ledger_native as n; print('argus_ledger_native', n.crate_version())"
+
       # Installs the built wheel the way a user would: dependencies resolved from PyPI, no --no-deps.
       - name: Install the wheel with its dependencies in a clean venv
         shell: bash

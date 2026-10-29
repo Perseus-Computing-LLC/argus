@@ -10,6 +10,7 @@ import os
 import uuid
 import warnings
 from typing import Any, Dict, Iterator, Optional
+from . import _native
 from .hasher import (
     compute_event_hash,
     ed25519_public_key,
@@ -276,6 +277,55 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+    def _iter_lines(self) -> Iterator[str]:
+        """Yield every non-blank line in file order under a shared lock, without parsing it.
+        The native verifier parses fail-closed, so a torn line fails at its chain position."""
+        if not os.path.exists(self.ledger_path):
+            return
+        with open(self.ledger_path, "r", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        yield line
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def _verify_chain_native(
+        self,
+        anchor: Optional[ChainAnchor],
+        legacy_timestamps_before: Optional[int],
+        now_ts: str,
+    ) -> ChainVerificationReport:
+        """verify_chain through the Rust ChainVerifier; same report shape and warning contract."""
+        out = _native.verify_lines(
+            self._iter_lines(),
+            anchor=(anchor.sequence, anchor.event_hash) if anchor is not None else None,
+            verifying_key=self._ed25519_public_key,
+            legacy_timestamps_before=legacy_timestamps_before,
+        )
+        detail = out["error_detail"]
+        if out["failure_kind"] == "parse":
+            # Same wording as the Python loop's LedgerCorruptionError path.
+            detail = f"Malformed or partial event record at sequence {out['first_broken_sequence']}: {detail}"
+        for text in out["warnings"]:
+            warnings.warn(text, UserWarning, stacklevel=3)
+        return ChainVerificationReport(
+            valid=out["valid"],
+            total_events=out["total_events"],
+            root_hash=out["root_hash"],
+            head_hash=out["head_hash"],
+            first_broken_sequence=out["first_broken_sequence"],
+            error_detail=detail,
+            checked_at=now_ts,
+            legacy_events=out["legacy_events"],
+            legacy_timestamp_regressions=out["legacy_timestamp_regressions"],
+            warnings=list(out["warnings"]),
+            anchored=anchor is not None,
+            verifier="native",
+        )
+
     def iter_events(self, start: int = 1, end: Optional[int] = None) -> Iterator[AuditEvent]:
         for event in self._iter_records():
             if event.sequence < start:
@@ -330,6 +380,13 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                 raise ValueError("legacy_timestamps_before must be >= 1")
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         anchored = anchor is not None
+
+        # One verifier in two languages (issue #15): with the argus_ledger_native extension
+        # present, the Rust ChainVerifier produces the verdict. HMAC-signed ledgers stay here
+        # because the Rust crate has no HMAC scheme; ARGUS_LEDGER_PURE_PYTHON=1 opts out.
+        hmac_signed = self._key is not None and not self._use_ed25519
+        if _native.enabled() and not hmac_signed:
+            return self._verify_chain_native(anchor, legacy_timestamps_before, now_ts)
 
         # Running state: a 50k-record ledger must not cost 50k resident models (F3).
         position = 0

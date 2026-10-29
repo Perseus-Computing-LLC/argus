@@ -50,6 +50,9 @@ class NativeVerifierTest(unittest.TestCase):
             _skip_or_fail(self, "argus_ledger_native extension not built (bindings/python, maturin develop)")
         self.dir = tempfile.mkdtemp(prefix="argus_native_")
         self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         os.environ.pop(PURE, None)
 
     def _path(self, name):

@@ -217,8 +217,9 @@ class CrossVerifierMatrixTest(unittest.TestCase):
         return report.valid, report.first_broken_sequence
 
     def _verify_python_native(self, path):
-        os.environ.pop(PURE, None)
-        report = AppendOnlyLedger(path).verify_chain()
+        with mock.patch.dict(os.environ):
+            os.environ.pop(PURE, None)
+            report = AppendOnlyLedger(path).verify_chain()
         self.assertEqual(report.verifier, "native")
         return report.valid, report.first_broken_sequence
 
@@ -288,8 +289,10 @@ class CrossVerifierMatrixTest(unittest.TestCase):
     def _verify_python_legacy(self, path, cutoff, pure=True):
         import warnings as _warnings
 
-        with mock.patch.dict(os.environ, {PURE: "1"} if pure else {}), _warnings.catch_warnings(record=True) as caught:
-            if not pure:
+        with mock.patch.dict(os.environ), _warnings.catch_warnings(record=True) as caught:
+            if pure:
+                os.environ[PURE] = "1"
+            else:
                 os.environ.pop(PURE, None)
             _warnings.simplefilter("always")
             report = AppendOnlyLedger(path).verify_chain(legacy_timestamps_before=cutoff)

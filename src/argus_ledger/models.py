@@ -79,3 +79,10 @@ class ChainVerificationReport(BaseModel):
         default=False,
         description="True if the chain was checked against an external anchor (detects rollback and rewrites up to it).",
     )
+    verifier: str = Field(
+        default="python",
+        description=(
+            "Which implementation produced the verdict: 'python' (the pure-Python loop) or 'native' "
+            "(the Rust ChainVerifier through the argus_ledger_native extension)."
+        ),
+    )

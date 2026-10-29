@@ -1,4 +1,5 @@
 /target
+bindings/python/target/
 __pycache__/
 *.py[cod]
 *.class
