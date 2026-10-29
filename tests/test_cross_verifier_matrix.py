@@ -1,7 +1,8 @@
 """F5: one timestamp contract, one malformed-line contract, across every writer and verifier.
 
-Matrix: {Python writer, Rust writer} x {Python verify_chain, Rust FileLedger::verify_chain,
-argus-verify CLI} over adversarial ledgers. Every cell must return the same verdict and the same
+Matrix: {Python writer, Rust writer} x {Python verify_chain (pure loop), Python verify_chain
+through the argus_ledger_native extension, Rust FileLedger::verify_chain, argus-verify CLI} over
+adversarial ledgers. Every cell must return the same verdict and the same
 broken position. The Rust cells need rustc, a built libargus_ledger.rlib and the argus-verify
 binary (CI builds the crate before pytest); without them the Rust cells are skipped, not passed.
 """
@@ -12,13 +13,15 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from argus_ledger import AppendOnlyLedger
+from argus_ledger import AppendOnlyLedger, _native
 from argus_ledger.hasher import compute_event_hash
 from argus_ledger.timestamps import timestamp_nanos
 
 REPO = Path(__file__).resolve().parents[1]
+PURE = "ARGUS_LEDGER_PURE_PYTHON"
 MAX_SAFE_INT = 2**53 - 1
 
 
@@ -208,7 +211,16 @@ class CrossVerifierMatrixTest(unittest.TestCase):
     # --- verifiers: each returns (valid, first_broken_sequence) -----------------------------
 
     def _verify_python(self, path):
-        report = AppendOnlyLedger(path).verify_chain()
+        with mock.patch.dict(os.environ, {PURE: "1"}):
+            report = AppendOnlyLedger(path).verify_chain()
+        self.assertEqual(report.verifier, "python")
+        return report.valid, report.first_broken_sequence
+
+    def _verify_python_native(self, path):
+        with mock.patch.dict(os.environ):
+            os.environ.pop(PURE, None)
+            report = AppendOnlyLedger(path).verify_chain()
+        self.assertEqual(report.verifier, "native")
         return report.valid, report.first_broken_sequence
 
     def _verify_rust_lib(self, path):
@@ -230,6 +242,8 @@ class CrossVerifierMatrixTest(unittest.TestCase):
 
     def _verifiers(self):
         yield "python", self._verify_python
+        if _native.available():
+            yield "python_native", self._verify_python_native
         if self.runner:
             yield "rust_lib", self._verify_rust_lib
         if self.cli:
@@ -238,8 +252,8 @@ class CrossVerifierMatrixTest(unittest.TestCase):
     def test_every_writer_and_verifier_agree_on_every_adversarial_ledger(self):
         verifiers = list(self._verifiers())
         writers = list(self._ledgers())
-        if len(verifiers) < 3 or len(writers) < 2:
-            _skip_or_fail(self, "Rust toolchain, libargus_ledger.rlib or argus-verify binary missing")
+        if len(verifiers) < 4 or len(writers) < 2:
+            _skip_or_fail(self, "Rust toolchain, libargus_ledger.rlib, argus-verify binary or argus_ledger_native missing")
         cells = 0
         for writer_name, write in writers:
             for case_name, (mutate, expected) in _cases().items():
@@ -272,14 +286,22 @@ class CrossVerifierMatrixTest(unittest.TestCase):
 
     # Each returns (valid, first_broken_sequence, legacy_timestamp_regressions, warning_count).
 
-    def _verify_python_legacy(self, path, cutoff):
+    def _verify_python_legacy(self, path, cutoff, pure=True):
         import warnings as _warnings
 
-        with _warnings.catch_warnings(record=True) as caught:
+        with mock.patch.dict(os.environ), _warnings.catch_warnings(record=True) as caught:
+            if pure:
+                os.environ[PURE] = "1"
+            else:
+                os.environ.pop(PURE, None)
             _warnings.simplefilter("always")
             report = AppendOnlyLedger(path).verify_chain(legacy_timestamps_before=cutoff)
+        self.assertEqual(report.verifier, "python" if pure else "native")
         self.assertEqual(len(caught), len(report.warnings), [str(w.message) for w in caught])
         return report.valid, report.first_broken_sequence, report.legacy_timestamp_regressions, len(report.warnings)
+
+    def _verify_python_native_legacy(self, path, cutoff):
+        return self._verify_python_legacy(path, cutoff, pure=False)
 
     def _verify_rust_lib_legacy(self, path, cutoff):
         cmd = [self.runner, "verify", path] + ([str(cutoff)] if cutoff is not None else [])
@@ -297,6 +319,8 @@ class CrossVerifierMatrixTest(unittest.TestCase):
 
     def _legacy_verifiers(self):
         yield "python", self._verify_python_legacy
+        if _native.available():
+            yield "python_native", self._verify_python_native_legacy
         if self.runner:
             yield "rust_lib", self._verify_rust_lib_legacy
         if self.cli:
@@ -326,8 +350,8 @@ class CrossVerifierMatrixTest(unittest.TestCase):
         because the regression is at the cutoff, where the strict rule applies."""
         verifiers = list(self._legacy_verifiers())
         writers = list(self._ledgers10())
-        if len(verifiers) < 3 or len(writers) < 2:
-            _skip_or_fail(self, "Rust toolchain, libargus_ledger.rlib or argus-verify binary missing")
+        if len(verifiers) < 4 or len(writers) < 2:
+            _skip_or_fail(self, "Rust toolchain, libargus_ledger.rlib, argus-verify binary or argus_ledger_native missing")
 
         def regression_at_5(r):
             r[4]["timestamp"] = r[3]["timestamp"]

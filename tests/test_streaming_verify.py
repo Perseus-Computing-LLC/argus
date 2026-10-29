@@ -53,21 +53,28 @@ class StreamingVerifyTest(unittest.TestCase):
 
     def test_long_ledger_verifies_with_at_most_one_record_resident(self):
         seen = []
-        original = _Ledger._iter_records
+        original_records, original_lines = _Ledger._iter_records, _Ledger._iter_lines
 
-        def counting(self_):
+        def counting_records(self_):
             # Each record is yielded and dropped before the next is parsed: the verifier keeps
             # the running state only. Count yields; a materialising implementation would read
             # all of them before checking the first.
-            for ev in original(self_):
+            for ev in original_records(self_):
                 seen.append(ev.sequence)
                 yield ev
 
-        _Ledger._iter_records = counting
+        def counting_lines(self_):
+            # The native path hands the Rust verifier one line at a time through the same
+            # kind of generator; pyo3 pulls it lazily, so the count proves the same property.
+            for line in original_lines(self_):
+                seen.append(line)
+                yield line
+
+        _Ledger._iter_records, _Ledger._iter_lines = counting_records, counting_lines
         try:
             report = self.ledger.verify_chain(ChainAnchor(sequence=self.N, event_hash=self.head.event_hash))
         finally:
-            _Ledger._iter_records = original
+            _Ledger._iter_records, _Ledger._iter_lines = original_records, original_lines
         self.assertTrue(report.valid, report.error_detail)
         self.assertEqual(report.total_events, self.N)
         self.assertEqual(report.head_hash, self.head.event_hash)
