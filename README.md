@@ -70,13 +70,13 @@ Try it without installing anything: [telarch.ai/argus](https://telarch.ai/argus)
 
 ## Measured
 
-Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) v0.1.0-alpha.9, built against argus-ledger 0.1.0-alpha.8, with synthetic data on one EC2 m8azn.metal-12xl bare-metal server. Every run, its range and the command that reproduces it are on [telarch.ai/evidence](https://telarch.ai/evidence).
+Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) v0.1.0-alpha.10, built against argus-ledger 0.1.0-alpha.8, with synthetic data on one EC2 m8azn.metal-12xl bare-metal server. Every run, its range and the command that reproduces it are on [telarch.ai/evidence](https://telarch.ai/evidence).
 
 | Measurement | Result |
 | --- | --- |
-| Appends per second, 1,000,000 events, `InMemoryLedger` (no file, no fsync) | 1,063,962 |
-| Events verified per second, full walk over events already parsed in memory | 2,493,261 |
-| Time to find an edit at event 500,000, events already parsed in memory | 196.9 ms |
+| Appends per second, 1,000,000 events, `InMemoryLedger` (no file, no fsync) | 1,060,258 |
+| Events verified per second, full walk over events already parsed in memory | 2,456,125 |
+| Time to find an edit at event 500,000, events already parsed in memory | 196.6 ms |
 | A fully re-hashed history passes a check without an anchor | yes |
 | The same history is caught by the anchor | yes |
 
