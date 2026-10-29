@@ -66,9 +66,17 @@ jobs:
       - name: Package crate
         run: cargo package
 
+      # Same as ci.yml: the native-verifier tests fail under CI=true unless the extension is importable.
+      - name: Build and install the argus_ledger_native extension
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip maturin
+          (cd bindings/python && maturin build --release --locked --out "$RUNNER_TEMP/native-wheel")
+          python -m pip install "$RUNNER_TEMP"/native-wheel/*.whl
+          python -c "import argus_ledger_native as n; print('argus_ledger_native', n.crate_version())"
+
       - name: Run Python tests
         run: |
-          python -m pip install --upgrade pip
           python -m pip install build pytest .
           python -m pytest tests -q
 
