@@ -111,6 +111,7 @@ Report a vulnerability to contact@perseuscomputing.com with `[SECURITY]` in the 
 ## Links
 
 - [telarch.ai/argus](https://telarch.ai/argus): overview and a live demo
+- [telarch.ai/chatgpt](https://telarch.ai/chatgpt): Telarch as an app for ChatGPT and a plugin for Codex
 - [Documentation (docs.rs)](https://docs.rs/argus-ledger)
 - [Changelog](CHANGELOG.md)
 
