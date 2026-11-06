@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import calendar
+import contextlib
 import datetime
+import errno
 import fcntl
-import json
+import io
 import os
+import stat
 import uuid
 import warnings
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Union
 from . import _native
 from .hasher import (
     compute_event_hash,
@@ -64,6 +67,89 @@ def _count_records(path: str) -> int:
         return sum(1 for line in fh if line.strip())
 
 
+# Group and other permission bits: a ledger file holds audit payloads and is kept owner-only.
+_GROUP_OTHER_BITS = 0o077
+# A writer that keeps finding a different file at the path after taking the lock gives up after this.
+_REOPEN_ATTEMPTS = 16
+
+
+def _restrict_to_owner(fd: int, path: str) -> None:
+    """Remove group/other permission bits from the file open at ``fd`` before anything is written to it.
+
+    The constructor creates the file 0600, but the file at the path can be replaced while a writer runs
+    (log rotation that creates a fresh file, an operator's ``touch`` under umask 022, another tool).
+    Raises ``PermissionError`` rather than write a payload into a file that group or others can read."""
+    mode = stat.S_IMODE(os.fstat(fd).st_mode)
+    if mode & _GROUP_OTHER_BITS:
+        try:
+            os.fchmod(fd, mode & ~_GROUP_OTHER_BITS)
+        except OSError as exc:
+            raise PermissionError(
+                f"Ledger file {path} is accessible to group or others (mode {mode:o}) and cannot be made "
+                f"owner-only: {exc}; refusing to append"
+            ) from exc
+
+
+class _PrefixReader(io.RawIOBase):
+    """The first ``size`` bytes of the file open at ``fd``, read with ``pread``.
+
+    The file is append-only, so those bytes never change once a snapshot has taken ``size`` under the
+    shared lock, and bytes appended later are never returned."""
+
+    def __init__(self, fd: int, size: int) -> None:
+        super().__init__()
+        self._fd = fd
+        self._size = size
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        want = min(len(buffer), self._size - self._pos)
+        if want <= 0:
+            return 0
+        chunk = os.pread(self._fd, want, self._pos)
+        buffer[: len(chunk)] = chunk
+        self._pos += len(chunk)
+        return len(chunk)
+
+
+def _snapshot_lines(path: str) -> Iterator[str]:
+    """Yield the lines of the file at ``path`` as it stood at one instant, holding no lock between yields.
+
+    The shared lock is held only while the file size is read. Writers hold LOCK_EX for a whole append,
+    so that size ends where the last complete append ended, and appends only add bytes after it. The
+    prefix is then read without a lock: a caller that appends while iterating, or never finishes, cannot
+    block (or self-deadlock) a writer. Lines are decoded exactly as ``open(path, encoding="utf-8")``
+    decodes them."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return
+    text: Optional[io.TextIOWrapper] = None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        try:
+            size = os.fstat(fd).st_size
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        text = io.TextIOWrapper(
+            io.BufferedReader(_PrefixReader(fd, size), buffer_size=_TAIL_BLOCK), encoding="utf-8"
+        )
+        yield from text
+    finally:
+        if text is not None:
+            text.close()  # closes the wrappers only; the descriptor is closed below
+        os.close(fd)
+
+
+def _parse_record(record: Union[str, bytes]) -> AuditEvent:
+    """Parse one stored record: the one parse shared by ``head()``, the readers and the writer's tail
+    gate, so the writer never extends a record its own reader rejects. Any failure propagates."""
+    return AuditEvent.model_validate_json(record)
+
+
 class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
     """Append-only audit ledger backed by a JSON-L file with POSIX file locking."""
 
@@ -85,7 +171,9 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         key. Such a ledger checks Ed25519 signatures only and cannot append. Never pass a public key as
         ``signing_key``: that is an HMAC secret, and anyone who knows the public key could sign with it.
 
-        ``require_signature=True`` refuses to open without a key. The ledger file is created owner-only (0600)."""
+        ``require_signature=True`` refuses to open without a key. The ledger file is created owner-only (0600),
+        on every append as well as here, and an existing file that group or others can access is made
+        owner-only when the ledger is opened (best effort) and before each append (or the append is refused)."""
         if signing_key is not None and verify_key is not None:
             raise ValueError("pass signing_key (to sign) or verify_key (to check Ed25519 signatures), not both")
         if require_signature and not (signing_key or verify_key):
@@ -109,6 +197,16 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         if not os.path.exists(self.ledger_path):
             fd = os.open(self.ledger_path, os.O_WRONLY | os.O_CREAT, 0o600)
             os.close(fd)
+        else:
+            # Like the Rust FileLedger::open (which resets the mode to 0600, best effort), records already
+            # in the file are kept owner-only: group/other bits are cleared, owner bits are left alone.
+            # Best effort here (a verifier may open a file it does not own); append() insists.
+            try:
+                mode = stat.S_IMODE(os.stat(self.ledger_path).st_mode)
+                if mode & _GROUP_OTHER_BITS:
+                    os.chmod(self.ledger_path, mode & ~_GROUP_OTHER_BITS)
+            except OSError:
+                pass
 
     @staticmethod
     def load_key(path: str) -> bytes:
@@ -118,6 +216,35 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             raise PermissionError(f"Key file {path} is readable by group or others (mode {mode:o}); chmod 600 it.")
         with open(path, "rb") as fh:
             return fh.read().strip()
+
+    def _open_locked_for_append(self) -> int:
+        """Return a descriptor for the file now at ``ledger_path``, opened for appending and held under LOCK_EX.
+
+        A missing file is created owner-only (0600) whatever the umask: a writer that outlives the file it
+        was constructed for (rotated away, moved aside, deleted) must not recreate it readable by group or
+        others. The lock is a lock on one file, not on the path, so after it is granted the descriptor is
+        checked to still be the file at the path; a writer that waited across a rotation would otherwise
+        append to the rotated file. Group/other bits on the file are then removed, or the append refused."""
+        for _ in range(_REOPEN_ATTEMPTS):
+            fd = os.open(self.ledger_path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                held = os.fstat(fd)
+                try:
+                    current = os.stat(self.ledger_path)
+                except FileNotFoundError:
+                    current = None
+                if current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
+                    _restrict_to_owner(fd, self.ledger_path)
+                    return fd
+            except BaseException:
+                os.close(fd)
+                raise
+            os.close(fd)  # releases the lock on the file that is no longer at the path; reopen
+        raise OSError(
+            errno.EAGAIN,
+            f"Ledger file {self.ledger_path} was replaced {_REOPEN_ATTEMPTS} times while waiting for its lock",
+        )
 
     def append(
         self,
@@ -133,76 +260,85 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         validate_identifiers(event_type, actor)
         validate_payload(payload)
 
-        with open(self.ledger_path, "a+", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                size = os.fstat(f.fileno()).st_size
-                tail = _tail_record(f.fileno())
+        fd = self._open_locked_for_append()
+        try:
+            size = os.fstat(fd).st_size
+            tail = _tail_record(fd)
 
-                last_instant: Optional[int] = None
-                if tail is None:
-                    sequence = 1
-                    prev_hash = GENESIS_PREV_HASH
+            last_instant: Optional[int] = None
+            if tail is None:
+                sequence = 1
+                prev_hash = GENESIS_PREV_HASH
+            else:
+                # The tail must be a record head() accepts, and its timestamp must parse: the
+                # strictly-increasing floor below is taken from it, and verify_chain() rejects a
+                # malformed timestamp. Extending (and signing onto) a tail the reader or the
+                # verifier rejects would chain new records to a head nobody can confirm.
+                try:
+                    last = _parse_record(tail)
+                except Exception as exc:
+                    raise LedgerCorruptionError(
+                        "Cannot append to ledger with corrupted tail record at line "
+                        f"{_count_records(self.ledger_path)}: {exc}"
+                    ) from exc
+                last_instant = timestamp_nanos(last.timestamp)
+                if last_instant is None:
+                    raise LedgerCorruptionError(
+                        "Cannot append to ledger with corrupted tail record at line "
+                        f"{_count_records(self.ledger_path)}: malformed timestamp {last.timestamp!r}"
+                    )
+                sequence = last.sequence + 1
+                prev_hash = last.event_hash
+
+            # Strictly increasing within the ledger even if the host clock steps backwards
+            # (seen in production: 47 decreasing transitions in 34k records). The guard is
+            # taken under the lock so two writers cannot pick the same instant. Format is
+            # unchanged: RFC 3339 UTC, explicit +00:00, microsecond resolution.
+            now_ts = _monotonic_utc_iso(last_instant)
+
+            event_hash = compute_event_hash(
+                sequence=sequence,
+                event_id=eid,
+                timestamp=now_ts,
+                event_type=event_type,
+                actor=actor,
+                prev_hash=prev_hash,
+                payload=payload,
+                hash_version=CURRENT_HASH_VERSION,
+            )
+
+            if self._key:
+                if self._use_ed25519:
+                    sig = sign_event_hash_ed25519(event_hash, self._key, hash_version=CURRENT_HASH_VERSION)
                 else:
-                    try:
-                        last_obj = json.loads(tail)
-                        sequence = int(last_obj["sequence"]) + 1
-                        prev_hash = str(last_obj["event_hash"])
-                        last_instant = timestamp_nanos(last_obj.get("timestamp", ""))
-                    except (ValueError, KeyError, TypeError) as exc:
-                        raise LedgerCorruptionError(
-                            "Cannot append to ledger with corrupted tail record at line "
-                            f"{_count_records(self.ledger_path)}: {exc}"
-                        ) from exc
+                    sig = sign_event_hash(event_hash, self._key, hash_version=CURRENT_HASH_VERSION)
+            else:
+                sig = None
 
-                # Strictly increasing within the ledger even if the host clock steps backwards
-                # (seen in production: 47 decreasing transitions in 34k records). The guard is
-                # taken under the lock so two writers cannot pick the same instant. Format is
-                # unchanged: RFC 3339 UTC, explicit +00:00, microsecond resolution.
-                now_ts = _monotonic_utc_iso(last_instant)
+            event = AuditEvent(
+                sequence=sequence,
+                event_id=eid,
+                timestamp=now_ts,
+                event_type=event_type,
+                actor=actor,
+                payload=payload,
+                prev_hash=prev_hash,
+                event_hash=event_hash,
+                signature=sig,
+                hash_version=CURRENT_HASH_VERSION,
+            )
 
-                event_hash = compute_event_hash(
-                    sequence=sequence,
-                    event_id=eid,
-                    timestamp=now_ts,
-                    event_type=event_type,
-                    actor=actor,
-                    prev_hash=prev_hash,
-                    payload=payload,
-                    hash_version=CURRENT_HASH_VERSION,
-                )
-
-                if self._key:
-                    if self._use_ed25519:
-                        sig = sign_event_hash_ed25519(event_hash, self._key, hash_version=CURRENT_HASH_VERSION)
-                    else:
-                        sig = sign_event_hash(event_hash, self._key, hash_version=CURRENT_HASH_VERSION)
-                else:
-                    sig = None
-
-                event = AuditEvent(
-                    sequence=sequence,
-                    event_id=eid,
-                    timestamp=now_ts,
-                    event_type=event_type,
-                    actor=actor,
-                    payload=payload,
-                    prev_hash=prev_hash,
-                    event_hash=event_hash,
-                    signature=sig,
-                    hash_version=CURRENT_HASH_VERSION,
-                )
-
-                # A record whose trailing newline was lost (torn write, manual edit) must not absorb
-                # this one: both would become one malformed line.
-                separator = "" if size == 0 or os.pread(f.fileno(), 1, size - 1) == b"\n" else "\n"
-                f.seek(0, os.SEEK_END)
-                f.write(separator + event.model_dump_json() + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-                return event
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            # A record whose trailing newline was lost (torn write, manual edit) must not absorb
+            # this one: both would become one malformed line.
+            separator = "" if size == 0 or os.pread(fd, 1, size - 1) == b"\n" else "\n"
+            data = memoryview((separator + event.model_dump_json() + "\n").encode("utf-8"))
+            while data:  # O_APPEND: every write lands at the end of the file
+                data = data[os.write(fd, data):]
+            os.fsync(fd)
+            return event
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def head(self) -> Optional[AuditEvent]:
         if not os.path.exists(self.ledger_path):
@@ -215,7 +351,7 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                 if record is None:
                     return None
                 try:
-                    return AuditEvent.model_validate_json(record)
+                    return _parse_record(record)
                 except Exception as exc:
                     raise LedgerCorruptionError(
                         f"Malformed tail event record at line {_count_records(self.ledger_path)}: {exc}"
@@ -250,47 +386,41 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         return None
 
     def _iter_records(self) -> Iterator[AuditEvent]:
-        """Yield every record in file order, one at a time, under a shared lock.
+        """Yield every record in file order, one at a time, from a snapshot of the file.
+
+        The shared lock is held only while the snapshot is taken (see ``_snapshot_lines``), never
+        between yields: a suspended iterator does not block writers, and ``append()`` inside the
+        loop does not deadlock. Records appended after the snapshot are not yielded.
 
         A non-blank line that does not parse raises ``LedgerCorruptionError`` whose
         ``position`` is the count of non-blank lines up to and including it: the chain
         position the record should occupy, never a value read from the record."""
-        if not os.path.exists(self.ledger_path):
-            return
-        with open(self.ledger_path, "r", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-            try:
-                position = 0
-                for line_no, line in enumerate(f, start=1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    position += 1
-                    try:
-                        yield AuditEvent.model_validate_json(line)
-                    except Exception as exc:
-                        err = LedgerCorruptionError(
-                            f"Malformed event record at line {line_no}: {exc}"
-                        )
-                        err.position = position  # type: ignore[attr-defined]
-                        raise err from exc
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        with contextlib.closing(_snapshot_lines(self.ledger_path)) as lines:
+            position = 0
+            for line_no, line in enumerate(lines, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                position += 1
+                try:
+                    event = _parse_record(line)
+                except Exception as exc:
+                    err = LedgerCorruptionError(
+                        f"Malformed event record at line {line_no}: {exc}"
+                    )
+                    err.position = position  # type: ignore[attr-defined]
+                    raise err from exc
+                yield event
 
     def _iter_lines(self) -> Iterator[str]:
-        """Yield every non-blank line in file order under a shared lock, without parsing it.
-        The native verifier parses fail-closed, so a torn line fails at its chain position."""
-        if not os.path.exists(self.ledger_path):
-            return
-        with open(self.ledger_path, "r", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-            try:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        yield line
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        """Yield every non-blank line in file order from a snapshot of the file, without parsing it;
+        no lock is held between yields. The native verifier parses fail-closed, so a torn line fails
+        at its chain position."""
+        with contextlib.closing(_snapshot_lines(self.ledger_path)) as lines:
+            for line in lines:
+                line = line.strip()
+                if line:
+                    yield line
 
     def _verify_chain_native(
         self,
