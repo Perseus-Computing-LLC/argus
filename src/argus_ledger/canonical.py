@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Dict
 
 
 def canonical_json_dumps(obj: Any) -> str:
@@ -28,6 +28,11 @@ def canonical_json_dumps(obj: Any) -> str:
 MAX_IDENTIFIER_BYTES = 256
 MAX_PAYLOAD_BYTES = 1 << 20
 MAX_SAFE_INTEGER = 2**53 - 1
+#: Deepest nesting ``append`` accepts, counting the payload object itself as level 1 (the Rust crate's
+#: ``MAX_PAYLOAD_DEPTH``). Both verifiers read stored payloads up to ``MAX_STORED_PAYLOAD_DEPTH``
+#: levels, the point where the Rust JSON parser stops; the writers stop well short of it.
+MAX_PAYLOAD_DEPTH = 112
+MAX_STORED_PAYLOAD_DEPTH = 127
 
 _EVENT_TYPE = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)*$")
 # Printable ASCII without whitespace, quotes or backslashes: no control characters, log-line
@@ -74,7 +79,27 @@ def validate_identifiers(event_type: str, actor: str) -> None:
         )
 
 
-def _check_values(obj: Any, path: str) -> None:
+def _check_keys(obj: Dict[Any, Any], path: str) -> None:
+    """Refuse object keys whose stored form would not hash back to what was signed.
+
+    ``json.dumps`` sorts keys as given and only then writes non-string keys as text, so
+    ``{2: .., 10: ..}`` is hashed as ``{"2":..,"10":..}`` while a verifier, which reads strings,
+    hashes ``{"10":..,"2":..}``; ``None``, ``bool`` and ``float`` keys are also spelt differently by
+    the serializer that writes the record. Integer keys are kept only where writing them as text
+    leaves their order unchanged, so that the hash of the stored record is the hash computed here."""
+    if all(type(k) is str for k in obj):
+        return
+    if not all(type(k) is int for k in obj):
+        raise PayloadError(f"{path} has a key that is not a string; JSON object keys must be strings")
+    keys = list(obj)
+    if sorted(str(k) for k in keys) != [str(k) for k in sorted(keys)]:
+        raise PayloadError(
+            f"{path} has integer keys whose order changes when they are stored as JSON strings; "
+            "use string keys"
+        )
+
+
+def _check_values(obj: Any, path: str, depth: int = 0) -> None:
     if isinstance(obj, bool) or obj is None or isinstance(obj, str):
         return
     if isinstance(obj, float):
@@ -88,17 +113,23 @@ def _check_values(obj: Any, path: str) -> None:
         if abs(obj) > MAX_SAFE_INTEGER:
             raise IntegerRangeError(f"{path} is {obj}; integers must lie within +/-{MAX_SAFE_INTEGER}")
         return
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            _check_values(v, f"{path}.{k}")
-    elif isinstance(obj, (list, tuple)):
-        for i, v in enumerate(obj):
-            _check_values(v, f"{path}[{i}]")
+    if isinstance(obj, (dict, list, tuple)):
+        # Checked before descending, so a payload that contains itself is refused here too.
+        if depth >= MAX_PAYLOAD_DEPTH:
+            raise PayloadError(f"payload is nested deeper than {MAX_PAYLOAD_DEPTH} levels")
+        if isinstance(obj, dict):
+            _check_keys(obj, path)
+            for k, v in obj.items():
+                _check_values(v, f"{path}.{k}", depth + 1)
+        else:
+            for i, v in enumerate(obj):
+                _check_values(v, f"{path}[{i}]", depth + 1)
 
 
 def validate_payload(obj: Any, path: str = "payload") -> None:
     """Refuse what the Rust writer's ``validate_canonical_payload`` refuses: a non-object, any
-    ``float``, any integer outside +/-(2**53 - 1), or a canonical encoding over 1 MiB.
+    ``float``, any integer outside +/-(2**53 - 1), nesting deeper than ``MAX_PAYLOAD_DEPTH``, or a
+    canonical encoding over 1 MiB; and object keys that are not strings (see ``_check_keys``).
 
     Python prints the shortest round-trip repr (``-9.865914147294541``, ``1e-07``); serde_json prints
     ``1e-7`` and, without the ``float_roundtrip`` feature, parses 16-17 digit values inexactly. Either
