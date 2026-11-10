@@ -40,7 +40,7 @@ class TestSigning(unittest.TestCase):
             ledger.append("tool_execution", "agent", {"i": i})
 
     def test_ledger_file_is_owner_only(self):
-        AppendOnlyLedger(self.path)
+        AppendOnlyLedger(self.path).append("tool_execution", "agent", {"i": 0})  # the first append creates it
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
 
     def test_unkeyed_chain_misses_a_full_rewrite(self):

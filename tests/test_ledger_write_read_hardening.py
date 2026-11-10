@@ -301,6 +301,6 @@ def test_snapshot_reader_decodes_like_a_text_file(tmp_path):
 
 def test_reader_on_a_missing_file_yields_nothing(tmp_path):
     ledger = AppendOnlyLedger(str(tmp_path / "ledger.jsonl"))
-    os.unlink(ledger.ledger_path)
+    assert not os.path.exists(ledger.ledger_path)  # constructing a ledger creates nothing
     assert list(ledger.iter_events()) == []
     assert ledger.get_event(1) is None
