@@ -538,53 +538,59 @@ class PraxaGovernanceGovernor:
 
 
 class MerkleMountainRange:
-    """Streaming Merkle Mountain Range (MMR) accumulator with peak bagging (SCITT / RFC 9943).
-    
-    Provides O(1) amortized appends and O(log N) inclusion proofs without requiring
-    tree rebalancing.
+    """Streaming Merkle Mountain Range (MMR) accumulator with peak bagging.
+
+    ``append`` is O(1) amortized: it hashes the leaf and merges equal-height peaks, never the
+    leaves already accumulated. The class has no inclusion-proof method.
+
+    Hashing separates the three kinds of value, as RFC 6962 does for leaves and nodes, so that a
+    leaf cannot stand in for an interior node or for a root:
+
+    - leaf:  ``sha256(0x00 || leaf_data)``
+    - node:  ``sha256(0x01 || left || right)`` over the two raw 32-byte child hashes
+    - root:  ``sha256(0x02 || leaf_count || peak_1 || ... || peak_k)``, the count as 8 bytes
+      big-endian and the raw peaks from the largest mountain to the smallest
+
+    The root binds the leaf count, so ranges of different sizes cannot share one. ``leaves`` and
+    ``peaks`` hold lowercase hex digests.
     """
+
+    _LEAF_TAG = b"\x00"
+    _NODE_TAG = b"\x01"
+    _ROOT_TAG = b"\x02"
+
     def __init__(self) -> None:
         self.leaves: List[str] = []
         self.peaks: List[str] = []
+        # Height of each mountain in ``peaks`` (0 for a single leaf), same order.
+        self._peak_heights: List[int] = []
 
     def append(self, leaf_data: str) -> int:
-        leaf_hash = hashlib.sha256(leaf_data.encode("utf-8")).hexdigest()
+        leaf_hash = hashlib.sha256(self._LEAF_TAG + leaf_data.encode("utf-8")).hexdigest()
         idx = len(self.leaves)
         self.leaves.append(leaf_hash)
-        self._recompute_peaks()
+        self.peaks.append(leaf_hash)
+        self._peak_heights.append(0)
+        # Two mountains of the same height merge into one a level higher; the peaks to the left
+        # of them are untouched, which is what keeps an append from re-hashing old leaves.
+        while len(self._peak_heights) >= 2 and self._peak_heights[-1] == self._peak_heights[-2]:
+            right = self.peaks.pop()
+            left = self.peaks.pop()
+            height = self._peak_heights.pop() + 1
+            self._peak_heights[-1] = height
+            self.peaks.append(self._node_hash(left, right))
         return idx
 
-    def _recompute_peaks(self) -> None:
-        self.peaks.clear()
-        n = len(self.leaves)
-        offset = 0
-
-        for power in range(63, -1, -1):
-            sub_size = 1 << power
-            if n >= sub_size and sub_size > 0:
-                peak = self._compute_subtree_root(offset, sub_size)
-                self.peaks.append(peak)
-                offset += sub_size
-                n -= sub_size
-
-    def _compute_subtree_root(self, start: int, size: int) -> str:
-        if size == 1:
-            return self.leaves[start]
-        half = size // 2
-        left = self._compute_subtree_root(start, half)
-        right = self._compute_subtree_root(start + half, half)
-        combined = f"{left}:{right}".encode("utf-8")
-        return hashlib.sha256(combined).hexdigest()
+    @classmethod
+    def _node_hash(cls, left: str, right: str) -> str:
+        return hashlib.sha256(cls._NODE_TAG + bytes.fromhex(left) + bytes.fromhex(right)).hexdigest()
 
     def get_bagged_root(self) -> str:
-        """Bags all mountain peaks right-to-left into a single 32-byte MMR root."""
-        if not self.peaks:
-            return hashlib.sha256(b"GENESIS_MMR_EMPTY").hexdigest()
-        acc = self.peaks[-1]
-        for peak in reversed(self.peaks[:-1]):
-            combined = f"{peak}:{acc}".encode("utf-8")
-            acc = hashlib.sha256(combined).hexdigest()
-        return acc
+        """Bags the leaf count and all mountain peaks, left to right, into a single 32-byte MMR root."""
+        bag = hashlib.sha256(self._ROOT_TAG + len(self.leaves).to_bytes(8, "big"))
+        for peak in self.peaks:
+            bag.update(bytes.fromhex(peak))
+        return bag.hexdigest()
 
     @staticmethod
     def create_blinded_commitment(payload: Dict[str, Any], salt: Optional[bytes] = None) -> Tuple[str, str]:
