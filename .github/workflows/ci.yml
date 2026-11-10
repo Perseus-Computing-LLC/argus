@@ -109,3 +109,14 @@ jobs:
       - name: Run pytest
         run: |
           pytest tests -v
+
+      # tests/rv1110_*.py are the finding tests of the 2026-11-10 review. Their names do not match
+      # pytest's default pattern, so the step above does not collect them; each is run here by
+      # path, in its own process, and the first failing file fails the job.
+      - name: Run the review finding tests (tests/rv1110_*.py)
+        shell: bash
+        run: |
+          for f in tests/rv1110_*.py; do
+            echo "== $f"
+            python -m pytest -q "$f" || { echo "finding test failed: $f"; exit 1; }
+          done

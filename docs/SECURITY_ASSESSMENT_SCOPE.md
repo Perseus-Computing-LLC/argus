@@ -43,12 +43,12 @@ Independent security reviewers should audit the following four core subsystems:
 - **Assumed Adversary:** An attacker possessing local operating-system privileges capable of directly writing, modifying, or truncating the raw `audit.jsonl` file.
 - **Security Guarantees:**
   - Argus is a *tamper-evident* ledger, not a *write-prevention* hardware security module.
-  - An attacker modifying any byte in an event must cause chain verification to fail at that sequence (`first_broken_sequence`).
+  - An attacker changing any value in an event, adding or repeating a member, or cutting a record short must cause chain verification to fail at that sequence (`first_broken_sequence`). The hash covers the parsed values, not the stored bytes: an edit that leaves every value the same (whitespace between JSON tokens, the order of a record's members, an equivalent string escape) is not detected.
   - An attacker attempting to regenerate hashes from the point of modification must fail verification when checked against any out-of-band anchor or signed checkpoint.
   - Concurrent writes must be coordinated via `fcntl` locking, preventing interleaved malformed lines from uncoordinated writers.
 
 ---
 
 ## 3. Prior Remediations (Reference)
-- **F1 (Self-bricking writer):** Resolved in PR #13 by atomic transaction flush and lock recovery.
+- **F1 (Self-bricking writer):** PR #13 made the writer refuse to extend a tail it cannot parse. An append is not an atomic transaction, and that refusal left three ways for a writer to block its own ledger, found in the 2026-11-10 review (R3-2, R3-4, R3-9) and fixed in the unreleased changes: a payload the reader cannot parse is refused before writing; a failed append is cut back to the pre-append length under the lock; an incomplete record left after the last newline by a crash is saved to a sidecar file and removed by the next append (see README, "Files, failed appends and torn tails"). A crash in the middle of an append still leaves that fragment in the file, and verification fails on it, until the next append runs.
 - **F2 (CLI parser line skipping):** Resolved in PR #14 by enforcing strict line-by-line JSON parsing and flagging any malformed or truncated line as a chain-breaking failure.
