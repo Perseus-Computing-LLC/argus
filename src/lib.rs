@@ -60,7 +60,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod file_ledger;
-pub use file_ledger::FileLedger;
+pub use file_ledger::{FileLedger, RecordLines};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -212,9 +212,13 @@ impl AuditEvent {
         .expect("Wire holds only integers and strings; serialization cannot fail")
     }
 
-    /// Parse an event from a JSON line, extracting canonical payload directly from raw bytes.
+    /// Parse one stored record. The line must hold exactly the members a writer emits, once
+    /// each: an unknown member or a repeated one is added text that no hash or signature covers,
+    /// so it is refused here rather than ignored. `hash_version`, when present, must be the
+    /// integer 1 or 2. The payload is read by [`canonical_stored_payload`].
     pub fn from_json_line(line: &str) -> Result<Self, LedgerError> {
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct WireRef<'a> {
             sequence: u64,
             #[serde(borrow)]
@@ -233,45 +237,46 @@ impl AuditEvent {
             event_hash: std::borrow::Cow<'a, str>,
             #[serde(default, borrow)]
             signature: Option<std::borrow::Cow<'a, str>>,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "present")]
             hash_version: Option<serde_json::Value>,
         }
 
+        /// Keeps an explicit `"hash_version":null` apart from an absent member: only the
+        /// latter is a record written before the field existed.
+        fn present<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<serde_json::Value>, D::Error> {
+            serde::Deserialize::deserialize(deserializer).map(Some)
+        }
+
+        // One record is one line: padding at the ends is dropped, a line break inside the
+        // record is not JSON a writer produces and the Python reader would split or refuse it.
+        // The derive below would also read a JSON array as the fields in order; only the
+        // object form is a record.
+        let line = line.trim_matches(RECORD_PADDING);
+        if line.contains(['\r', '\n']) {
+            let detail = "malformed JSON: line break inside a record";
+            return Err(LedgerError::InvalidInput(detail.to_string()));
+        }
+        if !line.starts_with('{') {
+            let detail = "malformed JSON: a record must be a JSON object";
+            return Err(LedgerError::InvalidInput(detail.to_string()));
+        }
         let wire: WireRef = serde_json::from_str(line)
             .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
 
-        let (payload, hash_version) = match &wire.hash_version {
-            None => {
-                let v: serde_json::Value = serde_json::from_str(wire.payload.get())
-                    .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-                let canon = serde_json::to_string(&v).map_err(|e| {
-                    LedgerError::InvalidInput(format!("cannot serialize payload: {e}"))
-                })?;
-                (canon, 1)
-            }
+        let hash_version = match &wire.hash_version {
+            None => 1,
             Some(v) => match v.as_u64() {
-                Some(1) => {
-                    let val: serde_json::Value = serde_json::from_str(wire.payload.get())
-                        .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-                    let canon = serde_json::to_string(&val).map_err(|e| {
-                        LedgerError::InvalidInput(format!("cannot serialize payload: {e}"))
-                    })?;
-                    (canon, 1)
-                }
-                Some(2) => {
-                    let val: serde_json::Value = serde_json::from_str(wire.payload.get())
-                        .map_err(|e| LedgerError::InvalidInput(format!("malformed JSON: {e}")))?;
-                    let canon = serde_json::to_string(&val).map_err(|e| {
-                        LedgerError::InvalidInput(format!("cannot serialize payload: {e}"))
-                    })?;
-                    (canon, 2)
-                }
+                Some(1) => 1,
+                Some(2) => 2,
                 _ => {
                     let detail = format!("unsupported hash_version {v}");
                     return Err(LedgerError::InvalidInput(detail));
                 }
             },
         };
+        let payload = canonical_stored_payload(wire.payload.get())?;
 
         Ok(Self {
             sequence: wire.sequence,
@@ -423,10 +428,24 @@ pub fn sign_event_hash(signing_key: &ed25519_dalek::SigningKey, event_hash: &str
 
 /// Verify an event-hash signature. Only the lowercase-hex `ed25519:` encoding is accepted, and
 /// verification is strict (`verify_strict` rejects small-order public keys and `R` points).
+/// The signed message is the current one (format 2: domain tag, then the hash).
 pub fn verify_event_hash_ed25519(
     event_hash: &str,
     signature_hex: &str,
     public_key_bytes: &[u8; 32],
+) -> bool {
+    verify_event_signature_ed25519(event_hash, signature_hex, public_key_bytes, HASH_VERSION)
+}
+
+/// Verify the signature of a record written in hash format `hash_version`. A format-1 signature
+/// covers the bare event hash; format 2 covers the domain tag followed by the hash. This is the
+/// rule `argus_ledger.hasher` applies, so a signed format-1 ledger gets the same verdict from
+/// both verifiers.
+pub fn verify_event_signature_ed25519(
+    event_hash: &str,
+    signature_hex: &str,
+    public_key_bytes: &[u8; 32],
+    hash_version: u8,
 ) -> bool {
     use ed25519_dalek::{Signature, VerifyingKey};
     let Some(sig_bytes) = signature_hex
@@ -438,7 +457,10 @@ pub fn verify_event_hash_ed25519(
     let Ok(verifying_key) = VerifyingKey::from_bytes(public_key_bytes) else {
         return false;
     };
-    let message = [SIGNATURE_DOMAIN, event_hash.as_bytes()].concat();
+    let message = match hash_version {
+        1 => event_hash.as_bytes().to_vec(),
+        _ => [SIGNATURE_DOMAIN, event_hash.as_bytes()].concat(),
+    };
     verifying_key
         .verify_strict(&message, &Signature::from_bytes(&sig_bytes))
         .is_ok()
@@ -595,11 +617,22 @@ pub fn validate_canonical_payload(payload: &str) -> Result<(), LedgerError> {
             _ => true,
         }
     }
+    // Bounded by serde_json's own parse limit, so the recursion here is too.
+    fn depth(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+            serde_json::Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
     let invalid = |reason: &str| LedgerError::InvalidInput(format!("payload {reason}"));
     let value: serde_json::Value =
         serde_json::from_str(payload).map_err(|_| invalid("is not valid JSON"))?;
     if !value.is_object() || !canonical(&value) {
         return Err(invalid("must be a sorted-key object with safe integers"));
+    }
+    if depth(&value) > MAX_PAYLOAD_DEPTH {
+        return Err(invalid("is nested deeper than MAX_PAYLOAD_DEPTH levels"));
     }
     // Re-serialize into a comparing sink rather than a second O(payload) buffer.
     let mut sink = MatchesWriter {
@@ -611,6 +644,329 @@ pub fn validate_canonical_payload(payload: &str) -> Result<(), LedgerError> {
         return Err(invalid("is not in canonical form"));
     }
     Ok(())
+}
+
+/// Deepest nesting `append` accepts, counting the payload object itself as level 1. The Python
+/// writer applies the same number (`argus_ledger.canonical.MAX_PAYLOAD_DEPTH`). It sits below
+/// [`MAX_STORED_PAYLOAD_DEPTH`] so that no writer produces a record a verifier cannot read.
+pub const MAX_PAYLOAD_DEPTH: usize = 112;
+/// Deepest nesting either verifier reads in a stored payload; a deeper one is a malformed
+/// record. 127 is where `serde_json` stopped reading, so ledgers that verified before still do.
+pub const MAX_STORED_PAYLOAD_DEPTH: usize = 127;
+/// Characters every reader drops from both ends of a line before parsing it. A line that is
+/// empty afterwards is blank and skipped; any other line is a record. `argus_ledger.ledger`
+/// applies the same rule, so no reader calls a line blank that another one parses.
+pub const RECORD_PADDING: [char; 4] = [' ', '\t', '\r', '\n'];
+/// Longest integer token either verifier reads in a stored payload (the Python verifier's
+/// integer parser stops at this many digits).
+const MAX_INTEGER_DIGITS: usize = 4300;
+
+/// Canonical text of a stored payload: compact, keys sorted by code point, strings escaped the
+/// way `serde_json` and Python's `json.dumps(ensure_ascii=False)` escape them, integers as
+/// stored and floats as Python's `repr` prints them (the text the Python writer hashed before
+/// floats were refused).
+///
+/// The payload is read token by token so that the Python verifier can apply the same rules to
+/// the same bytes. Refused as malformed: a payload that is not an object, an object with a
+/// repeated key at any depth, the integer token `-0`, an integer longer than
+/// [`MAX_INTEGER_DIGITS`], a float that overflows a double, and nesting beyond
+/// [`MAX_STORED_PAYLOAD_DEPTH`].
+pub fn canonical_stored_payload(raw: &str) -> Result<String, LedgerError> {
+    let mut scanner = PayloadScanner {
+        text: raw,
+        bytes: raw.as_bytes(),
+        pos: 0,
+    };
+    scanner.skip_whitespace();
+    if scanner.peek() != Some(b'{') {
+        return Err(scanner.malformed("payload must be a JSON object"));
+    }
+    let mut out = String::with_capacity(raw.len());
+    scanner.value(&mut out, 1)?;
+    scanner.skip_whitespace();
+    if scanner.pos != scanner.bytes.len() {
+        return Err(scanner.malformed("unexpected text after the payload"));
+    }
+    Ok(out)
+}
+
+struct PayloadScanner<'a> {
+    text: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PayloadScanner<'a> {
+    fn malformed(&self, reason: &str) -> LedgerError {
+        LedgerError::InvalidInput(format!("malformed payload at byte {}: {reason}", self.pos))
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect(&mut self, byte: u8) -> Result<(), LedgerError> {
+        if self.peek() != Some(byte) {
+            return Err(self.malformed(&format!("expected `{}`", byte as char)));
+        }
+        self.pos += 1;
+        Ok(())
+    }
+
+    /// Append the canonical text of the value at `pos` to `out`. `depth` is the level the
+    /// value would occupy if it is an object or array.
+    fn value(&mut self, out: &mut String, depth: usize) -> Result<(), LedgerError> {
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b'{') => self.object(out, depth),
+            Some(b'[') => self.array(out, depth),
+            Some(b'"') => {
+                let (_, canonical) = self.string()?;
+                out.push_str(&canonical);
+                Ok(())
+            }
+            Some(b'-' | b'0'..=b'9') => self.number(out),
+            _ => {
+                for literal in ["true", "false", "null"] {
+                    if self.text[self.pos..].starts_with(literal) {
+                        self.pos += literal.len();
+                        out.push_str(literal);
+                        return Ok(());
+                    }
+                }
+                Err(self.malformed("expected a JSON value"))
+            }
+        }
+    }
+
+    fn enter(&mut self, depth: usize) -> Result<(), LedgerError> {
+        if depth > MAX_STORED_PAYLOAD_DEPTH {
+            return Err(self.malformed("nested deeper than MAX_STORED_PAYLOAD_DEPTH levels"));
+        }
+        self.pos += 1;
+        self.skip_whitespace();
+        Ok(())
+    }
+
+    fn array(&mut self, out: &mut String, depth: usize) -> Result<(), LedgerError> {
+        self.enter(depth)?;
+        out.push('[');
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            out.push(']');
+            return Ok(());
+        }
+        loop {
+            self.value(out, depth + 1)?;
+            self.skip_whitespace();
+            if self.peek() == Some(b',') {
+                self.pos += 1;
+                out.push(',');
+            } else {
+                self.expect(b']')?;
+                out.push(']');
+                return Ok(());
+            }
+        }
+    }
+
+    fn object(&mut self, out: &mut String, depth: usize) -> Result<(), LedgerError> {
+        self.enter(depth)?;
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            out.push_str("{}");
+            return Ok(());
+        }
+        // Each member's canonical text, keyed by the decoded key. Members are written in key
+        // order afterwards, whatever order they were stored in.
+        let mut members: Vec<(std::borrow::Cow<'a, str>, String)> = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek() != Some(b'"') {
+                return Err(self.malformed("expected an object key"));
+            }
+            let (key, canonical_key) = self.string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            let mut member = canonical_key.into_owned();
+            member.push(':');
+            self.value(&mut member, depth + 1)?;
+            members.push((key, member));
+            self.skip_whitespace();
+            if self.peek() == Some(b',') {
+                self.pos += 1;
+            } else {
+                self.expect(b'}')?;
+                break;
+            }
+        }
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        if members.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(self.malformed("an object repeats a key"));
+        }
+        out.push('{');
+        for (index, (_, member)) in members.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(member);
+        }
+        out.push('}');
+        Ok(())
+    }
+
+    /// The string token at `pos`: its decoded value and its canonical JSON text.
+    #[allow(clippy::type_complexity)]
+    fn string(
+        &mut self,
+    ) -> Result<(std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>), LedgerError> {
+        let start = self.pos;
+        let mut escaped = false;
+        self.pos += 1;
+        loop {
+            match self.peek() {
+                None => return Err(self.malformed("unterminated string")),
+                Some(b'"') => break,
+                Some(b'\\') => {
+                    escaped = true;
+                    self.pos += 2;
+                }
+                Some(byte) if byte < 0x20 => {
+                    return Err(self.malformed("control character in a string"));
+                }
+                Some(_) => self.pos += 1,
+            }
+        }
+        self.pos += 1;
+        let text: &'a str = self.text;
+        let token = &text[start..self.pos];
+        if !escaped {
+            // No escapes and no control characters: the token is already its canonical text.
+            return Ok((token[1..token.len() - 1].into(), token.into()));
+        }
+        let decoded: String = serde_json::from_str(token)
+            .map_err(|e| self.malformed(&format!("invalid string: {e}")))?;
+        let canonical = serde_json::to_string(&decoded)
+            .map_err(|e| self.malformed(&format!("cannot serialize string: {e}")))?;
+        Ok((decoded.into(), canonical.into()))
+    }
+
+    fn digits(&mut self) -> usize {
+        let start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        self.pos - start
+    }
+
+    fn number(&mut self, out: &mut String) -> Result<(), LedgerError> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        let integer_digits = match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                1
+            }
+            Some(b'1'..=b'9') => self.digits(),
+            _ => return Err(self.malformed("invalid number")),
+        };
+        let mut float = false;
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            float = true;
+            if self.digits() == 0 {
+                return Err(self.malformed("invalid number"));
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            float = true;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if self.digits() == 0 {
+                return Err(self.malformed("invalid number"));
+            }
+        }
+        if matches!(self.peek(), Some(b'0'..=b'9')) {
+            return Err(self.malformed("invalid number"));
+        }
+        let token = &self.text[start..self.pos];
+        if !float {
+            // Python reads `-0` as the integer 0; hashing either spelling would let the two
+            // verifiers disagree, and no writer emits it.
+            if token == "-0" {
+                return Err(self.malformed("integer token `-0`"));
+            }
+            if integer_digits > MAX_INTEGER_DIGITS {
+                return Err(self.malformed("integer has more than MAX_INTEGER_DIGITS digits"));
+            }
+            out.push_str(token);
+            return Ok(());
+        }
+        match token.parse::<f64>() {
+            Ok(value) if value.is_finite() => {
+                out.push_str(&python_float_repr(value));
+                Ok(())
+            }
+            _ => Err(self.malformed("float outside the range of a double")),
+        }
+    }
+}
+
+/// `repr(float)` as Python prints it, which is what `json.dumps` writes and therefore what the
+/// Python writer hashed while it still accepted floats: the shortest digits that read back to
+/// the same double, exponent form below 1e-4 and from 1e16 (`1e-07`, `1.5e-05`, `1e+16`),
+/// otherwise positional with at least one fractional digit (`0.5`, `100.0`).
+fn python_float_repr(value: f64) -> String {
+    // `{:e}` gives the same shortest digits as `d[.ddd]e[-]x`.
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` output of a finite float has an exponent");
+    let exponent: i32 = exponent
+        .parse()
+        .expect("`{:e}` exponent of a finite float is an integer");
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let mut out = String::from(sign);
+    if !(-4..16).contains(&exponent) {
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if exponent < 0 { '-' } else { '+' });
+        out.push_str(&format!("{:02}", exponent.unsigned_abs()));
+    } else if exponent < 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-exponent - 1) as usize));
+        out.push_str(&digits);
+    } else {
+        let integer_len = exponent as usize + 1;
+        if digits.len() <= integer_len {
+            out.push_str(&digits);
+            out.push_str(&"0".repeat(integer_len - digits.len()));
+            out.push_str(".0");
+        } else {
+            out.push_str(&digits[..integer_len]);
+            out.push('.');
+            out.push_str(&digits[integer_len..]);
+        }
+    }
+    out
 }
 
 /// `io::Write` sink that checks the bytes written to it against `expected` without storing them.
@@ -654,6 +1010,15 @@ pub fn parse_timestamp_nanos(s: &str) -> Option<u64> {
 /// seconds east of UTC. No suffix is treated as UTC. Returns None for a malformed offset.
 /// Before this existed `+05:00` records failed to parse and `Z` records were read as UTC only by
 /// luck of the fraction parser, so Python-written ledgers could not be verified by this crate.
+/// A decimal field of a timestamp: ASCII digits only. `str::parse` on its own also accepts a
+/// leading `+` (and `-` for signed types), which the Python parser does not.
+fn decimal_field<T: std::str::FromStr>(s: &str) -> Option<T> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 fn split_utc_offset(s: &str) -> Option<(&str, i64)> {
     if let Some(body) = s.strip_suffix('Z') {
         return Some((body, 0));
@@ -670,12 +1035,17 @@ fn split_utc_offset(s: &str) -> Option<(&str, i64)> {
     if off.as_bytes()[3] != b':' {
         return None;
     }
-    let hh: i64 = off[1..3].parse().ok()?;
-    let mm: i64 = off[4..6].parse().ok()?;
+    let hh: i64 = decimal_field(&off[1..3])?;
+    let mm: i64 = decimal_field(&off[4..6])?;
     (hh <= 14 && mm <= 59).then_some((body, sign * (hh * 3600 + mm * 60)))
 }
 
 fn parse_iso8601_nanos(s: &str) -> Option<u64> {
+    // The grammar is ASCII; refusing anything else here also keeps the byte offsets below on
+    // character boundaries.
+    if !s.is_ascii() {
+        return None;
+    }
     let (s, offset_secs) = split_utc_offset(s)?;
     let bytes = s.as_bytes();
     if bytes.len() < 19
@@ -687,13 +1057,17 @@ fn parse_iso8601_nanos(s: &str) -> Option<u64> {
     {
         return None;
     }
-    let y: i64 = s.get(0..4)?.parse().ok()?;
-    let m: u64 = s.get(5..7)?.parse().ok()?;
-    let d: u64 = s.get(8..10)?.parse().ok()?;
-    let hour: u64 = s.get(11..13)?.parse().ok()?;
-    let min: u64 = s.get(14..16)?.parse().ok()?;
-    let sec: u64 = s.get(17..19)?.parse().ok()?;
+    let y: i64 = decimal_field(s.get(0..4)?)?;
+    let m: u64 = decimal_field(s.get(5..7)?)?;
+    let d: u64 = decimal_field(s.get(8..10)?)?;
+    let hour: u64 = decimal_field(s.get(11..13)?)?;
+    let min: u64 = decimal_field(s.get(14..16)?)?;
+    let sec: u64 = decimal_field(s.get(17..19)?)?;
 
+    // Year 0000 is outside the grammar on both sides (Python's calendar has no year 0).
+    if y == 0 {
+        return None;
+    }
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hour > 23 || min > 59 || sec > 60 {
         return None;
     }
@@ -1045,7 +1419,12 @@ impl<'a> ChainVerifier<'a> {
         }
         if let Some(key) = &self.policy.verifying_key {
             let signed = event.signature.as_deref().is_some_and(|signature| {
-                verify_event_hash_ed25519(&event.event_hash, signature, key.as_bytes())
+                verify_event_signature_ed25519(
+                    &event.event_hash,
+                    signature,
+                    key.as_bytes(),
+                    event.hash_version,
+                )
             });
             if !signed {
                 let detail = format!("missing or invalid signature at sequence {seq}");

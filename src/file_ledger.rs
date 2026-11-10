@@ -15,6 +15,129 @@ use crate::{
     VerificationPolicy, GENESIS_PREV_HASH, HASH_VERSION, MAX_PAYLOAD_BYTES,
 };
 
+/// `bytes` without the padding every reader drops from both ends of a line
+/// ([`crate::RECORD_PADDING`]: space, tab, CR, LF).
+fn trim_padding(bytes: &[u8]) -> &[u8] {
+    let padding = |b: &u8| matches!(*b, b' ' | b'\t' | b'\r' | b'\n');
+    let start = bytes
+        .iter()
+        .position(|b| !padding(b))
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !padding(b))
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// Parse one stored line. Bytes that are not UTF-8 are a malformed record like any other line
+/// that does not parse, so a verifier reports them at their position instead of failing to read.
+fn parse_record_bytes(line: &[u8]) -> Result<AuditEvent, LedgerError> {
+    let text = std::str::from_utf8(line).map_err(|e| {
+        LedgerError::InvalidInput(format!("malformed JSON: record is not valid UTF-8: {e}"))
+    })?;
+    AuditEvent::from_json_line(text)
+}
+
+/// The records of a JSON Lines ledger, framed the way every reader of this crate and of the
+/// Python package frames them: a record ends at LF and nowhere else; spaces, tabs and CRs at
+/// both ends of a line are dropped; a line that is empty afterwards is skipped. Every other
+/// line is yielded with its 1-based line number and the result of parsing it. `Err` items are
+/// read failures; nothing follows one.
+pub struct RecordLines<R> {
+    reader: R,
+    line_no: usize,
+    buf: Vec<u8>,
+    done: bool,
+}
+
+impl<R: BufRead> RecordLines<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            line_no: 0,
+            buf: Vec::new(),
+            done: false,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for RecordLines<R> {
+    type Item = std::io::Result<(usize, Result<AuditEvent, LedgerError>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.done {
+            self.buf.clear();
+            match self.reader.read_until(b'\n', &mut self.buf) {
+                Ok(0) => self.done = true,
+                Ok(_) => {
+                    self.line_no += 1;
+                    let line = trim_padding(&self.buf);
+                    if !line.is_empty() {
+                        return Some(Ok((self.line_no, parse_record_bytes(line))));
+                    }
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Flush the directory at `dir` so that an entry just created in it survives a crash.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The directory holding `path`; `.` for a bare file name.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// `YYYYMMDDTHHMMSSffffffZ` for a time given as microseconds since the Unix epoch.
+fn utc_stamp(micros: u128) -> String {
+    let secs = (micros / 1_000_000) as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Day number to civil date in the proleptic Gregorian calendar (Hinnant, `civil_from_days`).
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}{:06}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        micros % 1_000_000
+    )
+}
+
+/// End of the file as an append finds it under the exclusive lock.
+struct Tail {
+    /// The last record, or `None` for an empty ledger.
+    last: Option<AuditEvent>,
+    /// Length of the file; the append writes from here and a failed one cuts back to here.
+    end_pos: u64,
+    /// The last record lost its newline, so one is written before the next record.
+    needs_newline: bool,
+}
+
 #[cfg(unix)]
 unsafe extern "C" {
     fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
@@ -40,14 +163,15 @@ pub struct FileLedger {
 }
 
 impl FileLedger {
-    /// Open or create an audit ledger at `path`.
-    ///
-    /// The file is created with owner-only (0600) permissions on Unix systems.
+    /// Open the audit ledger at `path`. Nothing is created here: the first append creates the
+    /// file, with owner-only (0600) permissions on Unix systems, and its missing directories.
+    /// Reading or verifying a path that does not exist therefore leaves it that way.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, LedgerError> {
         Self::open(path, None)
     }
 
-    /// Open or create an audit ledger at `path` that signs every event with an Ed25519 signing key.
+    /// Open the audit ledger at `path`, signing every appended event with an Ed25519 signing key.
+    /// Like [`FileLedger::new`], this creates nothing until the first append.
     pub fn with_signing_key<P: AsRef<Path>>(
         path: P,
         signing_key: ed25519_dalek::SigningKey,
@@ -60,25 +184,11 @@ impl FileLedger {
         signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Result<Self, LedgerError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                LedgerError::InvalidInput(format!("cannot create parent directory: {e}"))
-            })?;
-        }
 
-        // Ensure file exists with 0600 permissions
-        let mut opts = OpenOptions::new();
-        opts.create(true).read(true).append(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-
-        let file = opts.open(&path).map_err(|e| {
-            LedgerError::InvalidInput(format!("cannot open ledger file at {:?}: {e}", path))
-        })?;
-
+        // An existing file is kept owner-only (best effort; a verifier may not own it).
         #[cfg(unix)]
         {
-            if let Ok(metadata) = file.metadata() {
+            if let Ok(metadata) = std::fs::metadata(&path) {
                 let current_mode = metadata.permissions().mode() & 0o777;
                 if current_mode != 0o600 {
                     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -109,11 +219,9 @@ impl FileLedger {
         &self.ledger_id
     }
 
-    /// Read the last non-empty line of the file backwards: O(record), not O(file).
-    fn tail_record(file: &mut File) -> Result<Option<String>, LedgerError> {
-        let len = file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))?;
+    /// Read the last non-blank line of the first `len` bytes of the file backwards: O(record),
+    /// not O(file).
+    fn tail_record(file: &mut File, len: u64) -> Result<Option<String>, LedgerError> {
         if len == 0 {
             return Ok(None);
         }
@@ -134,11 +242,16 @@ impl FileLedger {
             chunk.extend_from_slice(&tail_buf);
             tail_buf = chunk;
 
-            // Search backwards for a newline
-            let trimmed = match tail_buf.iter().rposition(|&b| !b.is_ascii_whitespace()) {
-                Some(idx) => &tail_buf[..=idx],
-                None => continue,
-            };
+            // Search backwards for a newline. Only line padding is skipped: any other byte,
+            // such as 0x0C or 0x1C, is record content for every reader.
+            let end = tail_buf
+                .iter()
+                .rposition(|b| !matches!(*b, b' ' | b'\t' | b'\r' | b'\n'))
+                .map_or(0, |idx| idx + 1);
+            let trimmed = &tail_buf[..end];
+            if trimmed.is_empty() {
+                continue;
+            }
 
             let line_start = match trimmed.iter().rposition(|&b| b == b'\n') {
                 Some(idx) => idx + 1,
@@ -146,14 +259,194 @@ impl FileLedger {
                 None => continue,
             };
 
-            let line_bytes = &trimmed[line_start..];
+            let line_bytes = trim_padding(&trimmed[line_start..]);
             let s = std::str::from_utf8(line_bytes).map_err(|e| {
                 LedgerError::HashMismatch(format!("tail record is not valid UTF-8: {e}"))
             })?;
-            return Ok(Some(s.trim().to_string()));
+            return Ok(Some(s.to_string()));
         }
 
         Ok(None)
+    }
+
+    /// The bytes after the last newline of the first `len` bytes of the file, and the offset
+    /// at which they start. Empty when the file ends with a newline.
+    fn unterminated_tail(file: &mut File, len: u64) -> Result<(u64, Vec<u8>), LedgerError> {
+        let mut pos = len;
+        let mut tail = Vec::new();
+        while pos > 0 {
+            let chunk_size = pos.min(TAIL_BLOCK_SIZE);
+            pos -= chunk_size;
+            file.seek(SeekFrom::Start(pos))
+                .map_err(|e| LedgerError::LockError(format!("seek chunk failed: {e}")))?;
+            let mut chunk = vec![0u8; chunk_size as usize];
+            file.read_exact(&mut chunk)
+                .map_err(|e| LedgerError::LockError(format!("read chunk failed: {e}")))?;
+            if let Some(idx) = chunk.iter().rposition(|&b| b == b'\n') {
+                let mut fragment = chunk.split_off(idx + 1);
+                fragment.extend_from_slice(&tail);
+                return Ok((pos + idx as u64 + 1, fragment));
+            }
+            chunk.extend_from_slice(&tail);
+            tail = chunk;
+        }
+        Ok((0, tail))
+    }
+
+    /// Open the ledger file for an append. A missing file is created owner-only (0600) along
+    /// with its missing directories, and the directories are flushed: without that a crash
+    /// can lose the new file's name although its records were synced.
+    fn open_for_append(&self) -> Result<File, LedgerError> {
+        let open_err = |e: std::io::Error| {
+            LedgerError::LockError(format!("cannot open ledger file for writing: {e}"))
+        };
+        let mut existing = OpenOptions::new();
+        existing.read(true).write(true);
+        match existing.open(&self.path) {
+            Ok(file) => return Ok(file),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(open_err(e)),
+            Err(_) => {}
+        }
+
+        let parent = parent_dir(&self.path);
+        let mut created_dirs = Vec::new();
+        let mut probe = parent;
+        while !probe.is_dir() {
+            created_dirs.push(probe);
+            match probe.parent() {
+                Some(up) if !up.as_os_str().is_empty() => probe = up,
+                _ => break,
+            }
+        }
+        std::fs::create_dir_all(parent).map_err(|e| {
+            LedgerError::InvalidInput(format!("cannot create parent directory: {e}"))
+        })?;
+        for made in created_dirs {
+            sync_dir(parent_dir(made)).map_err(|e| {
+                LedgerError::LockError(format!("cannot sync directory of {made:?}: {e}"))
+            })?;
+        }
+
+        let mut fresh = OpenOptions::new();
+        fresh.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        fresh.mode(0o600);
+        match fresh.open(&self.path) {
+            Ok(file) => {
+                sync_dir(parent).map_err(|e| {
+                    LedgerError::LockError(format!("cannot sync ledger directory: {e}"))
+                })?;
+                Ok(file)
+            }
+            // Another writer created it in between; append to that file.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                existing.open(&self.path).map_err(open_err)
+            }
+            Err(e) => Err(open_err(e)),
+        }
+    }
+
+    /// Read the end of the file for an append; the caller holds the exclusive lock.
+    ///
+    /// Bytes after the last newline that are not a record are what a writer killed in the
+    /// middle of an append leaves behind. Once the record before them has parsed, they are set
+    /// aside (see [`FileLedger::set_aside_torn_tail`]). A complete record that lost only its
+    /// newline is kept. Readers and verifiers never do this; they keep reporting the fragment
+    /// as a malformed record until a writer runs.
+    fn prepare_tail(&self, file: &mut File) -> Result<Tail, LedgerError> {
+        let len = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))?;
+        let (torn_at, fragment) = Self::unterminated_tail(file, len)?;
+        let unterminated = trim_padding(&fragment);
+        let torn = !unterminated.is_empty() && parse_record_bytes(unterminated).is_err();
+        let end_pos = if torn { torn_at } else { len };
+
+        let last = match Self::tail_record(file, end_pos)? {
+            None => None,
+            Some(line) => Some(AuditEvent::from_json_line(&line)?),
+        };
+        if torn {
+            self.set_aside_torn_tail(file, torn_at, &fragment)?;
+        }
+        Ok(Tail {
+            last,
+            end_pos,
+            needs_newline: !torn && !fragment.is_empty(),
+        })
+    }
+
+    /// Remove an incomplete record from the end of the file. `fragment` is everything after
+    /// the last newline, starting at `offset`. It is first copied to
+    /// `<ledger>.torn-<offset>-<UTC time>` (0600, synced) in the ledger's directory; if that
+    /// copy cannot be written nothing is removed.
+    fn set_aside_torn_tail(
+        &self,
+        file: &mut File,
+        offset: u64,
+        fragment: &[u8],
+    ) -> Result<(), LedgerError> {
+        let micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_micros());
+        let mut sidecar = self.path.clone().into_os_string();
+        sidecar.push(format!(".torn-{offset}-{}", utc_stamp(micros)));
+        let sidecar = PathBuf::from(sidecar);
+
+        let save = || -> std::io::Result<()> {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut copy = opts.open(&sidecar)?;
+            copy.write_all(fragment)?;
+            copy.sync_all()?;
+            sync_dir(parent_dir(&sidecar))
+        };
+        save().map_err(|e| {
+            LedgerError::LockError(format!(
+                "cannot append to ledger with an incomplete record at byte {offset}: saving it \
+                 to {sidecar:?} failed ({e}); nothing was removed"
+            ))
+        })?;
+        file.set_len(offset)
+            .and_then(|()| file.sync_data())
+            .map_err(|e| {
+                LedgerError::LockError(format!(
+                    "cannot append to ledger with an incomplete record at byte {offset}: it was \
+                     saved to {sidecar:?} but could not be removed ({e}); the tail needs recovery"
+                ))
+            })
+    }
+
+    /// Write `bytes` at `end_pos`, the end of the file, and flush them. If either step fails
+    /// the file is cut back to `end_pos` before the error is returned: the caller is told the
+    /// append failed, so no part of it may stay. If the cut fails too, the error says that the
+    /// tail needs recovery.
+    fn commit(file: &mut File, end_pos: u64, bytes: &[u8]) -> Result<(), LedgerError> {
+        let written = file
+            .seek(SeekFrom::Start(end_pos))
+            .map_err(|e| format!("seek end failed: {e}"))
+            .and_then(|_| {
+                file.write_all(bytes)
+                    .map_err(|e| format!("write_all failed: {e}"))
+            })
+            .and_then(|()| {
+                file.sync_data()
+                    .map_err(|e| format!("sync_data failed: {e}"))
+            });
+        let Err(cause) = written else {
+            return Ok(());
+        };
+        if let Err(e) = file.set_len(end_pos) {
+            return Err(LedgerError::LockError(format!(
+                "{cause}, and what the append wrote could not be removed ({e}): the ledger tail \
+                 needs recovery; bytes from offset {end_pos} on are not an acknowledged record"
+            )));
+        }
+        // Best effort: the append has already failed and is reported as such.
+        let _ = file.sync_data();
+        Err(LedgerError::LockError(cause))
     }
 
     #[cfg(unix)]
@@ -235,53 +528,29 @@ impl FileLedger {
 
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
 
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-
-        let mut file = opts.open(&self.path).map_err(|e| {
-            LedgerError::LockError(format!("cannot open ledger file for writing: {e}"))
-        })?;
+        let mut file = self.open_for_append()?;
 
         Self::flock_ex(&file)?;
 
         let append_res = (|| -> Result<Vec<AuditEvent>, LedgerError> {
-            let (mut cur_seq, mut cur_prev_hash, mut last_ts) = match Self::tail_record(&mut file)?
-            {
+            let tail = self.prepare_tail(&mut file)?;
+            let (mut cur_seq, mut cur_prev_hash, mut last_ts) = match tail.last {
                 None => (1u64, GENESIS_PREV_HASH.to_string(), None),
-                Some(last_line) => {
-                    let last_ev = AuditEvent::from_json_line(&last_line)?;
-                    (
-                        last_ev.sequence + 1,
-                        last_ev.event_hash,
-                        crate::parse_timestamp_nanos(&last_ev.timestamp),
-                    )
-                }
+                Some(last_ev) => (
+                    last_ev.sequence + 1,
+                    last_ev.event_hash,
+                    crate::parse_timestamp_nanos(&last_ev.timestamp),
+                ),
             };
 
-            let mut end_pos = file
-                .seek(SeekFrom::End(0))
-                .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))?;
-
             let mut bytes_to_write = Vec::new();
-            if end_pos > 0 {
-                file.seek(SeekFrom::Start(end_pos - 1))
-                    .map_err(|e| LedgerError::LockError(format!("seek last byte failed: {e}")))?;
-                let mut last_byte = [0u8; 1];
-                file.read_exact(&mut last_byte)
-                    .map_err(|e| LedgerError::LockError(format!("read last byte failed: {e}")))?;
-                if last_byte[0] != b'\n' {
-                    bytes_to_write.push(b'\n');
-                    end_pos += 1;
-                }
-                file.seek(SeekFrom::End(0))
-                    .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))?;
+            if tail.needs_newline {
+                bytes_to_write.push(b'\n');
             }
 
             let mut committed = Vec::with_capacity(events.len());
             let mut index_entries = Vec::with_capacity(events.len());
-            let mut running_offset = end_pos;
+            let mut running_offset = tail.end_pos + u64::from(tail.needs_newline);
 
             for (i, &(event_type, actor, payload)) in events.iter().enumerate() {
                 let sequence = cur_seq;
@@ -331,11 +600,7 @@ impl FileLedger {
                 committed.push(event);
             }
 
-            file.write_all(&bytes_to_write)
-                .map_err(|e| LedgerError::LockError(format!("write_all failed: {e}")))?;
-
-            file.sync_data()
-                .map_err(|e| LedgerError::LockError(format!("sync_data failed: {e}")))?;
+            Self::commit(&mut file, tail.end_pos, &bytes_to_write)?;
 
             let mut idx = self.index.lock().unwrap_or_else(|p| p.into_inner());
             idx.extend(index_entries);
@@ -373,28 +638,20 @@ impl AuditLedgerWriter for FileLedger {
 
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
 
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-
-        let mut file = opts.open(&self.path).map_err(|e| {
-            LedgerError::LockError(format!("cannot open ledger file for writing: {e}"))
-        })?;
+        let mut file = self.open_for_append()?;
 
         Self::flock_ex(&file)?;
 
         let append_res = (|| -> Result<AuditEvent, LedgerError> {
-            let (sequence, prev_hash, last_ts) = match Self::tail_record(&mut file)? {
+            let tail = self.prepare_tail(&mut file)?;
+            let end_pos = tail.end_pos;
+            let (sequence, prev_hash, last_ts) = match tail.last {
                 None => (1u64, GENESIS_PREV_HASH.to_string(), None),
-                Some(last_line) => {
-                    let last_ev = AuditEvent::from_json_line(&last_line)?;
-                    (
-                        last_ev.sequence + 1,
-                        last_ev.event_hash,
-                        crate::parse_timestamp_nanos(&last_ev.timestamp),
-                    )
-                }
+                Some(last_ev) => (
+                    last_ev.sequence + 1,
+                    last_ev.event_hash,
+                    crate::parse_timestamp_nanos(&last_ev.timestamp),
+                ),
             };
 
             // Strictly increasing within the ledger, even if the host clock steps backwards or
@@ -434,32 +691,15 @@ impl AuditLedgerWriter for FileLedger {
 
             let line = event.to_json_line();
 
-            let end_pos = file
-                .seek(SeekFrom::End(0))
-                .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))?;
-
             let mut bytes_to_write = Vec::new();
-            if end_pos > 0 {
-                file.seek(SeekFrom::Start(end_pos - 1))
-                    .map_err(|e| LedgerError::LockError(format!("seek last byte failed: {e}")))?;
-                let mut last_byte = [0u8; 1];
-                file.read_exact(&mut last_byte)
-                    .map_err(|e| LedgerError::LockError(format!("read last byte failed: {e}")))?;
-                if last_byte[0] != b'\n' {
-                    bytes_to_write.push(b'\n');
-                }
-                file.seek(SeekFrom::End(0))
-                    .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))?;
+            if tail.needs_newline {
+                bytes_to_write.push(b'\n');
             }
 
             bytes_to_write.extend_from_slice(line.as_bytes());
             bytes_to_write.push(b'\n');
 
-            file.write_all(&bytes_to_write)
-                .map_err(|e| LedgerError::LockError(format!("write_all failed: {e}")))?;
-
-            file.sync_data()
-                .map_err(|e| LedgerError::LockError(format!("sync_data failed: {e}")))?;
+            Self::commit(&mut file, end_pos, &bytes_to_write)?;
 
             let mut idx = self.index.lock().unwrap_or_else(|p| p.into_inner());
             idx.push((sequence, end_pos));
@@ -498,15 +738,10 @@ impl AuditLedgerReader for FileLedger {
             file.seek(SeekFrom::Start(seek_offset))
                 .map_err(|e| LedgerError::LockError(format!("seek failed: {e}")))?;
 
-            let reader = BufReader::new(file);
-            for line_res in reader.lines() {
-                let line = line_res
-                    .map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let event = AuditEvent::from_json_line(trimmed)?;
+            for record in RecordLines::new(BufReader::new(file)) {
+                let (_, parsed) =
+                    record.map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
+                let event = parsed?;
                 if event.sequence == sequence {
                     return Ok(Some(event));
                 }
@@ -533,7 +768,10 @@ impl AuditLedgerReader for FileLedger {
             .map_err(|e| LedgerError::LockError(format!("cannot open ledger for head: {e}")))?;
 
         Self::flock_sh(&file)?;
-        let tail = Self::tail_record(&mut file);
+        let tail = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| LedgerError::LockError(format!("seek end failed: {e}")))
+            .and_then(|len| Self::tail_record(&mut file, len));
         Self::flock_un(&file);
 
         match tail? {
@@ -554,23 +792,17 @@ impl AuditLedgerReader for FileLedger {
 
         Self::flock_sh(&file)?;
 
-        let reader = BufReader::new(file);
         let mut events = Vec::new();
 
-        for (idx, line_res) in reader.lines().enumerate() {
-            let line =
-                line_res.map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let event = AuditEvent::from_json_line(trimmed).map_err(|e| {
-                LedgerError::HashMismatch(format!("malformed line {}: {e}", idx + 1))
-            })?;
+        for record in RecordLines::new(BufReader::new(file)) {
+            let (line_no, parsed) =
+                record.map_err(|e| LedgerError::LockError(format!("read line failed: {e}")))?;
+            let event = parsed
+                .map_err(|e| LedgerError::HashMismatch(format!("malformed line {line_no}: {e}")))?;
             events.push(event);
         }
 
-        // The shared lock belongs to `file`, which the `lines()` iterator owns; it is released
+        // The shared lock belongs to `file`, which the record iterator owns; it is released
         // when that iterator drops at the end of the loop. Unlocking a freshly opened descriptor
         // would not touch it.
         Ok(events)
@@ -587,33 +819,31 @@ impl AuditVerifier for FileLedger {
     ) -> Result<ChainVerificationReport, LedgerError> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
 
-        if !self.path.exists() {
-            return policy.verify_stream(std::iter::empty());
-        }
-
+        // A file that is not there is not an intact empty ledger (it may have been deleted, or
+        // its volume may not be mounted), so this is an error and never a valid report.
         let file = File::open(&self.path)
             .map_err(|e| LedgerError::LockError(format!("cannot open ledger for verify: {e}")))?;
         Self::flock_sh(&file)?;
 
         let mut io_error = None;
-        let records = BufReader::new(&file)
-            .lines()
-            .enumerate()
-            .map_while(|(idx, line_res)| match line_res {
-                Ok(line) => Some(line),
+        let mut last_line = 0;
+        let records = RecordLines::new(BufReader::new(&file))
+            .map_while(|record| match record {
+                Ok((line_no, parsed)) => {
+                    last_line = line_no;
+                    Some((line_no, parsed))
+                }
                 Err(e) => {
                     io_error = Some(LedgerError::LockError(format!(
                         "read line {} failed: {e}",
-                        idx + 1
+                        last_line + 1
                     )));
                     None
                 }
             })
-            .enumerate()
-            .filter(|(_, line)| !line.trim().is_empty())
-            .map(|(idx, line)| {
-                AuditEvent::from_json_line(line.trim()).map_err(|e| {
-                    LedgerError::InvalidInput(format!("malformed line {}: {e}", idx + 1))
+            .map(|(line_no, parsed)| {
+                parsed.map_err(|e| {
+                    LedgerError::InvalidInput(format!("malformed line {line_no}: {e}"))
                 })
             });
         let report = policy.verify_stream(records);

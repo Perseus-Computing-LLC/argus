@@ -9,7 +9,7 @@
 use argus_ledger::{AuditEvent, ChainAnchor, ChainVerificationReport, ChainVerifier, LedgerError, VerificationPolicy};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 /// Stable, language-neutral name for the failure class, so the Python wrapper can phrase the
 /// parse case the way its own loop always has without parsing an error string.
@@ -47,7 +47,8 @@ fn report_to_dict<'py>(
     Ok(out)
 }
 
-/// Verify an iterable of ledger lines (each one JSON record, blanks already removed).
+/// Verify an iterable of ledger lines (each one JSON record, blanks already removed). A line
+/// is a `str` or the stored `bytes`.
 ///
 /// `anchor` is `(sequence, event_hash)`; `verifying_key` is a raw 32-byte Ed25519 public key;
 /// `legacy_timestamps_before` is the accept-as-historic cutoff (issue #14), already validated
@@ -86,8 +87,22 @@ fn verify_lines<'py>(
     };
     let mut verifier = ChainVerifier::new(&policy);
     for item in lines.try_iter()? {
-        let line: String = item?.extract()?;
-        match AuditEvent::from_json_line(&line) {
+        let item = item?;
+        // A `bytes` line is a record as stored. One that is not UTF-8 is a malformed record at
+        // its position, like any other line that does not parse; it must not raise.
+        let parsed = if item.is_instance_of::<PyBytes>() {
+            let raw: Vec<u8> = item.extract()?;
+            match std::str::from_utf8(&raw) {
+                Ok(line) => AuditEvent::from_json_line(line),
+                Err(error) => Err(LedgerError::InvalidInput(format!(
+                    "malformed JSON: record is not valid UTF-8: {error}"
+                ))),
+            }
+        } else {
+            let line: String = item.extract()?;
+            AuditEvent::from_json_line(&line)
+        };
+        match parsed {
             Ok(event) => {
                 if let Some(report) = verifier.push(&event) {
                     return report_to_dict(py, &report, false);
