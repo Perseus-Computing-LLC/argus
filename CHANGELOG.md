@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.9] - 2026-11-11
+
 ### Fixed (review of 2026-11-10, `review_notes/R3.md`)
 
 Records written by earlier versions verify as before, with one intended difference (R3-8).
@@ -62,7 +64,8 @@ Records written by earlier versions verify as before, with one intended differen
 
 - `bindings/python`: `argus_ledger_native`, a pyo3 extension over the crate's `ChainVerifier`
   (`verify_lines`), `AuditEvent::to_json_line` (`canonical_json_line`) and `crate_version` (#15).
-  Optional; the pure-Python package does not depend on it.
+  Optional; the pure-Python package does not depend on it. It is not on PyPI in this release:
+  build it from `bindings/python` with `maturin build --release --locked`.
 - `AppendOnlyLedger.verify_chain` runs through the extension when it is importable, for unsigned and
   Ed25519-signed ledgers, and through the Python loop otherwise, for HMAC-signed ledgers (the crate has
   no HMAC scheme), or when `ARGUS_LEDGER_PURE_PYTHON=1` is set. `ChainVerificationReport.verifier`

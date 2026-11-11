@@ -22,17 +22,17 @@ Agents run commands, call APIs and edit files. Afterwards the log is the only ac
 
 ## Install
 
-This README describes 0.1.0-alpha.8 (0.1.0a8 on PyPI). It is a pre-release, so name the version.
+This README describes 0.1.0-alpha.9 (0.1.0a9 on PyPI). It is a pre-release, so name the version.
 
 ```toml
 # Rust: Cargo.toml
 [dependencies]
-argus-ledger = "0.1.0-alpha.8"
+argus-ledger = "0.1.0-alpha.9"
 ```
 
 ```bash
 # Python
-pip install argus-ledger==0.1.0a8
+pip install argus-ledger==0.1.0a9
 ```
 
 ## Quickstart

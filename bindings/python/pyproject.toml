@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "argus-ledger-native"
-version = "0.1.0a8"
+version = "0.1.0a9"
 description = "Python extension exposing the argus-ledger Rust chain verifier."
 readme = "README.md"
 license = { text = "MIT" }
