@@ -576,6 +576,13 @@ fn test_file_ledger_create_permissions_and_sync() {
     let path = tmp.join("audit.jsonl");
 
     let ledger = crate::FileLedger::new(&path).expect("open ledger");
+    assert!(!path.exists(), "opening a ledger must not create the file");
+
+    let ev1 = ledger
+        .append("agent.startup", "coordinator", "{\"status\":\"ok\"}")
+        .expect("append ev1");
+    assert_eq!(ev1.sequence, 1);
+    assert_eq!(ev1.prev_hash, GENESIS_PREV_HASH);
 
     #[cfg(unix)]
     {
@@ -587,12 +594,6 @@ fn test_file_ledger_create_permissions_and_sync() {
             "ledger file must be created with 0600 permissions"
         );
     }
-
-    let ev1 = ledger
-        .append("agent.startup", "coordinator", "{\"status\":\"ok\"}")
-        .expect("append ev1");
-    assert_eq!(ev1.sequence, 1);
-    assert_eq!(ev1.prev_hash, GENESIS_PREV_HASH);
 
     let ev2 = ledger
         .append("tool.exec", "worker_1", "{\"command\":\"test\"}")
@@ -1137,4 +1138,194 @@ fn gd_append_batch_and_sparse_index_and_canonical_bytes() {
         "canonical payload preserved without float rounding: {}",
         parsed.payload
     );
+}
+
+/// R3-14: opening and verifying a path that does not exist creates nothing and is an error,
+/// never a valid empty chain. R3-12: the first append creates the missing directories too.
+#[test]
+fn r3_missing_ledger_is_not_created_by_readers_and_not_valid() {
+    let tmp = tempfile_dir("r3_missing");
+    let path = tmp.join("sub").join("dir").join("audit.jsonl");
+
+    let ledger = FileLedger::new(&path).unwrap();
+    assert!(ledger.verify_chain().is_err());
+    assert_eq!(ledger.head().unwrap(), None);
+    assert!(ledger.all_events().unwrap().is_empty());
+    assert!(!tmp.join("sub").exists(), "a reader created the directory");
+
+    ledger.append("a", "b", r#"{"n":1}"#).unwrap();
+    assert!(path.is_file());
+    assert!(ledger.verify_chain().unwrap().valid);
+}
+
+/// R3-9: bytes after the last newline that are not a record are saved to a sidecar and removed
+/// by the next append, and only by an append. Verification reports them and changes nothing.
+#[test]
+fn r3_torn_tail_is_set_aside_by_append_only() {
+    let tmp = tempfile_dir("r3_torn");
+    let path = tmp.join("audit.jsonl");
+    let ledger = FileLedger::new(&path).unwrap();
+    ledger.append("a", "b", r#"{"n":1}"#).unwrap();
+    ledger.append("a", "b", r#"{"n":2}"#).unwrap();
+
+    let intact = std::fs::read(&path).unwrap();
+    let fragment = br#"{"sequence":3,"event_id":"ev_torn","timest"#;
+    let mut torn = intact.clone();
+    torn.extend_from_slice(fragment);
+    std::fs::write(&path, &torn).unwrap();
+
+    let report = ledger.verify_chain().unwrap();
+    assert!(!report.valid);
+    assert_eq!(report.first_broken_sequence, Some(3));
+    assert!(ledger.head().is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        torn,
+        "a reader changed the file"
+    );
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 1);
+
+    let third = ledger.append("a", "b", r#"{"n":3}"#).unwrap();
+    assert_eq!(third.sequence, 3);
+    let report = ledger.verify_chain().unwrap();
+    assert!(report.valid, "{:?}", report.error_detail);
+    assert_eq!(report.total_events, 3);
+    assert_eq!(ledger.get_event(3).unwrap().unwrap(), third);
+    assert!(std::fs::read(&path).unwrap().starts_with(&intact));
+
+    let prefix = format!("audit.jsonl.torn-{}-", intact.len());
+    let sidecars: Vec<_> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(&prefix)
+        })
+        .collect();
+    assert_eq!(
+        sidecars.len(),
+        1,
+        "one sidecar named after the ledger and the offset"
+    );
+    assert_eq!(std::fs::read(&sidecars[0]).unwrap(), fragment);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&sidecars[0])
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+/// R3-9 control: a complete record that lost only its final newline is a record. It is kept,
+/// the next append chains from it, and no sidecar is written. A fragment behind a record that
+/// does not parse is not repaired either: the append is refused and the file left alone.
+#[test]
+fn r3_complete_record_without_newline_is_kept() {
+    let tmp = tempfile_dir("r3_no_newline");
+    let path = tmp.join("audit.jsonl");
+    let ledger = FileLedger::new(&path).unwrap();
+    ledger.append("a", "b", r#"{"n":1}"#).unwrap();
+    let second = ledger.append("a", "b", r#"{"n":2}"#).unwrap();
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.pop(), Some(b'\n'));
+    std::fs::write(&path, &bytes).unwrap();
+
+    let third = ledger.append("a", "b", r#"{"n":3}"#).unwrap();
+    assert_eq!(third.prev_hash, second.event_hash);
+    assert_eq!(ledger.verify_chain().unwrap().total_events, 3);
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 1, "no sidecar");
+
+    let damaged = tmp.join("damaged.jsonl");
+    std::fs::write(&damaged, b"not a record\n{\"sequence\":2,\"eve").unwrap();
+    let before = std::fs::read(&damaged).unwrap();
+    assert!(FileLedger::new(&damaged)
+        .unwrap()
+        .append("a", "b", "{}")
+        .is_err());
+    assert_eq!(std::fs::read(&damaged).unwrap(), before);
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 2, "no sidecar");
+}
+
+/// R3-10, R3-11: one framing for every reader. A record ends at LF only; a line of bytes that
+/// are not line padding is a record (and malformed), never blank; bytes that are not UTF-8 are
+/// a malformed record at their position, not a read error.
+#[test]
+fn r3_readers_share_one_framing() {
+    let tmp = tempfile_dir("r3_framing");
+    let path = tmp.join("audit.jsonl");
+    let ledger = FileLedger::new(&path).unwrap();
+    ledger.append("a", "b", r#"{"n":1}"#).unwrap();
+    ledger.append("a", "b", r#"{"n":2}"#).unwrap();
+    let intact = std::fs::read(&path).unwrap();
+
+    // Blank lines and CRLF line ends are padding.
+    let mut padded = intact.clone();
+    padded.extend_from_slice(b"\r\n \t\n\n");
+    std::fs::write(&path, &padded).unwrap();
+    assert!(ledger.verify_chain().unwrap().valid);
+    assert_eq!(ledger.head().unwrap().unwrap().sequence, 2);
+
+    for tail in [
+        &b"\x1c\n"[..],
+        b"\xc2\x85\n",
+        b"\xc2\xa0\n",
+        b"\x0c\n",
+        b"\xff\xfe\n",
+    ] {
+        let mut bytes = intact.clone();
+        bytes.extend_from_slice(tail);
+        std::fs::write(&path, &bytes).unwrap();
+        let report = ledger.verify_chain().unwrap();
+        assert!(!report.valid, "{tail:?} was read as blank");
+        assert_eq!(report.first_broken_sequence, Some(3), "{tail:?}");
+        assert!(ledger.head().is_err(), "{tail:?}");
+        assert!(ledger.all_events().is_err(), "{tail:?}");
+    }
+
+    // A CR inside a record does not split it and is not accepted as JSON whitespace.
+    let text = String::from_utf8(intact.clone()).unwrap();
+    let with_cr = text.replacen(r#","event_id""#, ",\r\"event_id\"", 1);
+    assert_ne!(with_cr, text);
+    std::fs::write(&path, with_cr).unwrap();
+    let report = ledger.verify_chain().unwrap();
+    assert!(!report.valid);
+    assert_eq!(report.first_broken_sequence, Some(1));
+}
+
+/// R3-2, R3-3: both writers refuse a payload nested deeper than `MAX_PAYLOAD_DEPTH` before
+/// anything is written, and what they accept the verifier reads back.
+#[test]
+fn r3_writers_refuse_payloads_deeper_than_the_limit() {
+    let nested = |depth: usize| {
+        format!(
+            "{}{}",
+            r#"{"k":"#.repeat(depth - 1) + "{}",
+            "}".repeat(depth - 1)
+        )
+    };
+    let tmp = tempfile_dir("r3_depth");
+    let path = tmp.join("audit.jsonl");
+    let file = FileLedger::new(&path).unwrap();
+    let memory = InMemoryLedger::new();
+
+    let too_deep = nested(MAX_PAYLOAD_DEPTH + 1);
+    assert!(matches!(
+        file.append("a", "b", &too_deep),
+        Err(LedgerError::InvalidInput(_))
+    ));
+    assert!(memory.append("a", "b", &too_deep).is_err());
+    assert!(!path.exists(), "a refused append created the file");
+
+    let deepest = nested(MAX_PAYLOAD_DEPTH);
+    file.append("a", "b", &deepest).unwrap();
+    memory.append("a", "b", &deepest).unwrap();
+    assert!(file.verify_chain().unwrap().valid);
+    assert!(memory.verify_chain().unwrap().valid);
 }

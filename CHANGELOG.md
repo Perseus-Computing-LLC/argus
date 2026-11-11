@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (review of 2026-11-10, `review_notes/R3.md`)
+
+Records written by earlier versions verify as before, with one intended difference (R3-8).
+
+- R3-1: `append()` refuses a payload with object keys that are not strings (`PayloadError`).
+  Integer keys are still accepted where storing them as text keeps their order (`{7: 1}`); a
+  dict such as `{2: .., 10: ..}` used to be written and could never be verified.
+- R3-2: both writers refuse a payload nested deeper than 112 levels (`MAX_PAYLOAD_DEPTH`, the
+  payload object is level 1) before writing. The Python writer used to store deeper payloads
+  that its own reader then could not parse, which blocked every later append.
+- R3-3: both verifiers read stored payloads up to 127 levels (`MAX_STORED_PAYLOAD_DEPTH`) and
+  reject deeper ones, instead of the Python verifier accepting what the Rust one refused.
+- R3-4: an append whose write fails part-way is cut back to the pre-append length under the
+  writer lock, in both writers. If that cut fails the error says the tail needs recovery.
+- R3-5: both verifiers reject a record with a repeated member, at any depth. The repeated
+  value was text that no hash or signature covered.
+- R3-6: both verifiers reject a record with an unknown member, a `sequence` or `hash_version`
+  that is not an integer token, or a `hash_version` other than 1 or 2.
+- R3-7: one timestamp grammar in both verifiers: ASCII digits only, no sign inside a field,
+  no trailing newline, no year 0000. A malformed timestamp is reported, not raised.
+- R3-8: an Ed25519-signed format-1 record is checked against the bare event hash by the Rust
+  verifier as well, so it now verifies there as it does in Python (was: rejected).
+- R3-9: an incomplete record after the last newline no longer blocks the ledger. The next
+  `append()` copies those bytes to `<ledger>.torn-<offset>-<UTC time>` (0600, fsynced), removes
+  them and appends. Verifiers never repair anything and keep reporting the fragment. If the
+  copy cannot be written, nothing is removed and the append fails.
+- R3-10: a line that is not valid UTF-8 is a malformed record at its position for every reader
+  (`argus-verify` exit 1); `verify_chain()` no longer raises `UnicodeDecodeError`.
+- R3-11: one line framing for every reader: records end at LF only; spaces, tabs and CRs at the
+  ends of a line are dropped; any other line must parse. Bytes such as 0x0C, 0x1C, U+0085 and
+  U+00A0 are no longer "blank" to some readers, and a CR or LF inside a record is rejected.
+- R3-12: the first append flushes the directory entry of the file it creates, and of any
+  directory it creates, in both writers.
+- R3-13: the Rust verifier writes a float of a format-1 payload the way Python's `repr` does
+  (`1e-05`, `1e+16`), so historic float payloads get the same verdict from both verifiers.
+- R3-14: constructing a ledger object no longer creates the file or its directories; the first
+  append does. `verify_chain()` on a missing path reports `valid=False` (Python) or returns an
+  error (Rust `FileLedger`), instead of creating an empty file and calling it valid.
+- R3-15: `MerkleMountainRange.append()` is incremental (about two hashes per append) instead
+  of recomputing every peak from all leaves.
+- R3-16: `MerkleMountainRange` hashes leaves (`0x00`), interior nodes (`0x01`) and the root
+  (`0x02`, with the leaf count) differently, so different leaf sets cannot share a root.
+  **Every root and peak this class produces changes.** The module is experimental and nothing
+  in the ledger format depends on it.
+- R3-17: both verifiers reject the integer token `-0` in a stored payload (no writer emits it).
+- R3-18: `verify_chain()` with the native extension no longer raises `OverflowError` for an
+  anchor sequence or `legacy_timestamps_before` above 2**64-1; it gives the Python verdict.
+- R3-19: an append whose `fsync` fails is cut back as in R3-4, so a reported failure never
+  leaves a chained record behind.
+- R3-20: both verifiers reject a record whose payload is not a JSON object.
+
 ### Added
 
 - `bindings/python`: `argus_ledger_native`, a pyo3 extension over the crate's `ChainVerifier`

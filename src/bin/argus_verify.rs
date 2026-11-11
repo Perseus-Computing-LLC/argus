@@ -9,12 +9,12 @@
 //! is not a complete record is an integrity failure at that file position.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use argus_ledger::{
-    AuditEvent, ChainAnchor, ChainVerificationReport, LedgerError, VerificationPolicy,
+    ChainAnchor, ChainVerificationReport, LedgerError, RecordLines, VerificationPolicy,
 };
 
 fn print_help() {
@@ -66,20 +66,23 @@ enum Failure {
 fn run_once(path: &Path, policy: &VerificationPolicy) -> Result<ChainVerificationReport, Failure> {
     let file = File::open(path).map_err(|e| Failure::Io(format!("failed to read file: {e}")))?;
     let mut io_error = None;
-    let records = BufReader::new(file)
-        .lines()
-        .enumerate()
-        .map_while(|(idx, line_res)| match line_res {
-            Ok(line) => Some((idx, line)),
+    let mut last_line = 0;
+    // `RecordLines` is the framing `FileLedger` and the Python package use: LF ends a record,
+    // and a line that is not UTF-8 is a malformed record (exit 1), not a read error (exit 2).
+    let records = RecordLines::new(BufReader::new(file))
+        .map_while(|record| match record {
+            Ok((line_no, parsed)) => {
+                last_line = line_no;
+                Some((line_no, parsed))
+            }
             Err(e) => {
-                io_error = Some(format!("read error at line {}: {e}", idx + 1));
+                io_error = Some(format!("read error at line {}: {e}", last_line + 1));
                 None
             }
         })
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(idx, line)| {
-            AuditEvent::from_json_line(line.trim()).map_err(|e| {
-                LedgerError::InvalidInput(format!("malformed record at line {}: {e}", idx + 1))
+        .map(|(line_no, parsed)| {
+            parsed.map_err(|e| {
+                LedgerError::InvalidInput(format!("malformed record at line {line_no}: {e}"))
             })
         });
     let outcome = policy.verify_stream(records);

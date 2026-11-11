@@ -19,9 +19,12 @@ import calendar
 import re
 from typing import Optional
 
-_CANONICAL_INT = re.compile(r"^(0|[1-9][0-9]*)$")
+# Matched with ``fullmatch`` and spelt with ``[0-9]``: ``$`` also matches before a trailing newline
+# and ``\d`` matches every Unicode decimal digit, neither of which the Rust parser accepts.
+_CANONICAL_INT = re.compile(r"0|[1-9][0-9]*")
 _ISO = re.compile(
-    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?$"
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})"
+    r"(?:\.([0-9]+))?(Z|[+-][0-9]{2}:[0-9]{2})?"
 )
 _U64_MAX = 2**64 - 1
 
@@ -30,10 +33,13 @@ def timestamp_nanos(value: str) -> Optional[int]:
     """Return nanoseconds since the epoch for a record timestamp, or None if malformed."""
     if not isinstance(value, str):
         return None
-    if _CANONICAL_INT.match(value):
+    if _CANONICAL_INT.fullmatch(value):
+        # More digits than a u64 can hold; also keeps ``int`` away from its digit limit.
+        if len(value) > 20:
+            return None
         n = int(value)
         return n if n <= _U64_MAX else None
-    m = _ISO.match(value)
+    m = _ISO.fullmatch(value)
     if m is None:
         return None
     year, month, day, hour, minute, second = (int(x) for x in m.group(1, 2, 3, 4, 5, 6))
@@ -41,6 +47,9 @@ def timestamp_nanos(value: str) -> Optional[int]:
     # Same bounds as the Rust parser: a leap second (60) is accepted, day 31 is not checked
     # against the month, and offsets up to +/-14:59 are allowed.
     if not (1 <= month <= 12 and 1 <= day <= 31 and hour <= 23 and minute <= 59 and second <= 60):
+        return None
+    # ``calendar.timegm`` raises for year 0; it is malformed, as it is for the Rust parser.
+    if year == 0:
         return None
     offset_secs = 0
     if offset and offset != "Z":
