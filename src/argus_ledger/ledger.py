@@ -83,8 +83,57 @@ def _fsync_directory(path: str) -> None:
         os.close(fd)
 
 
+def _fsync_naming_chain(directory: str) -> None:
+    """Flush every directory from ``directory`` up to the root of its filesystem.
+
+    ``fsync`` on a file makes its contents durable, not its name: the name lives as an entry of
+    its directory, that directory's name as an entry of its parent, and so on to the mount root.
+    There is no way to ask the kernel whether an entry is already durable, so a writer killed
+    between the syscall that created the file (or one of its directories) and the flush — the
+    lock wait in ``_open_locked_for_append`` can block arbitrarily long behind another writer,
+    and a watchdog or OOM kill in that window is realistic — a writer whose flush failed, or
+    another racing it to the same path, leaves the name unflushed for ever, and no later call
+    can tell. The chain is therefore flushed on every append, not by the call that created
+    anything: an append that has fsynced its record has also made the path naming it durable.
+
+    Stops without error at the filesystem root, at a device boundary (``directory`` or one of
+    its ancestors is a mount point, whose own name is another filesystem's to keep) and at any
+    directory that cannot be opened. A flush that is attempted and fails raises: an append
+    that could not make its own name durable must not report success.
+    """
+    try:
+        device = os.stat(directory).st_dev
+    except OSError:
+        return
+    child = directory
+    while True:
+        try:
+            fd = os.open(child, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError:
+            return  # nothing this process can flush at or above an unopenable directory
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        parent = os.path.dirname(child)
+        if parent == child:
+            return  # the filesystem root: its own name is not this filesystem's to keep
+        try:
+            if os.stat(parent).st_dev != device:
+                return  # child is a mount point; its name lives on another filesystem
+        except OSError:
+            return
+        child = parent
+
+
 def _make_directories(directory: str) -> None:
-    """Create ``directory`` and its missing parents, and flush the parent of each one created."""
+    """Create ``directory`` and its missing parents, and flush the parent of each one created.
+
+    The flushes happen before the caller goes on to create the ledger file, so a flush that
+    fails fails the append before the file exists. They cover only what this call created:
+    directories an interrupted earlier writer left behind are flushed by
+    ``_fsync_naming_chain``, which every append runs over the whole chain regardless of who
+    created what."""
     created: List[str] = []
     probe = directory
     while not os.path.isdir(probe):
@@ -394,13 +443,17 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
 
         A missing file is created owner-only (0600) whatever the umask, along with its missing
         directories: a writer that outlives the file it was constructed for (rotated away, moved aside,
-        deleted) must not recreate it readable by group or others. The directory is flushed after the
-        file is created; without that a crash can lose the new file's name while its records were
-        fsynced. The lock is a lock on one file, not on the path, so after it is granted the descriptor is
-        checked to still be the file at the path; a writer that waited across a rotation would otherwise
-        append to the rotated file. Group/other bits on the file are then removed, or the append refused."""
+        deleted) must not recreate it readable by group or others. The naming chain — the ledger's
+        directory and every directory above it up to the filesystem's root — is flushed on every
+        append, not only by the call that created the file: a writer killed between the create and the
+        flush (the lock wait below can block arbitrarily long behind another writer), one whose flush
+        failed, or another racing it to the same path leaves the name unflushed, and no later call can
+        tell. Without that a crash can lose the new file's name while its records were fsynced. The
+        lock is a lock on one file, not on the path, so after it is granted the descriptor is checked
+        to still be the file at the path; a writer that waited across a rotation would otherwise
+        append to the rotated file. Group/other bits on the file are then removed, or the append
+        refused."""
         directory = os.path.dirname(self.ledger_path)
-        created = False
         for _ in range(_REOPEN_ATTEMPTS):
             try:
                 fd = os.open(self.ledger_path, os.O_RDWR | os.O_APPEND | os.O_CLOEXEC)
@@ -412,7 +465,6 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     )
                 except FileExistsError:
                     continue  # another writer created it in between; open that file
-                created = True
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 held = os.fstat(fd)
@@ -422,8 +474,11 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                     current = None
                 if current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
                     _restrict_to_owner(fd, self.ledger_path)
-                    if created:
-                        _fsync_directory(directory)
+                    # Tied to the file, not to the call that created it: whether this append
+                    # created anything or not, the chain that names the ledger is made durable
+                    # before any record is written, so a failed flush fails the append with
+                    # the file unchanged.
+                    _fsync_naming_chain(directory)
                     return fd
             except BaseException:
                 os.close(fd)
