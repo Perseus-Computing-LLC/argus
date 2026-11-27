@@ -20,12 +20,53 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
+import json
+import math
 import secrets
 import threading
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
-from .canonical import canonical_json_bytes
+from .canonical import canonical_json_bytes, validate_json_keys
+
+
+def _json_digest(value: Any, what: str) -> str:
+    """SHA-256 of the canonical JSON of ``value``, refusing object keys whose stored (string) form
+    would hash differently, so a binding still verifies once its inputs have been stored as JSON."""
+    validate_json_keys(value, what)
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _text_digest(value: Any, what: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{what} must be a str, not {type(value).__name__}")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _index(value: Any, what: str) -> int:
+    """An int >= 0, exactly as given: a float or bool would be sealed as written ("3.0", "True") but
+    stored coerced (3, 1), and the record would then fail its own verification."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{what} must be an int, not {type(value).__name__}")
+    if value < 0:
+        raise ValueError(f"{what} must be >= 0")
+    return value
+
+
+_RAG_SEAL_DOMAIN = b"argus.proofweave.rag_triad.v2\x00"
+_MIN_COMMITMENT_SALT_BYTES = 16
+
+
+def _score(value: Any, what: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{what} must be a number, not {type(value).__name__}")
+    try:
+        value = float(value)
+    except OverflowError:
+        raise ValueError(f"{what} must lie in [0, 1]") from None
+    if not (math.isfinite(value) and 0.0 <= value <= 1.0):
+        raise ValueError(f"{what} must lie in [0, 1]")
+    return value
 
 
 class PolicyActionBinding(BaseModel):
@@ -52,10 +93,15 @@ class PolicyActionBinding(BaseModel):
         verdict: str,
         evidence: Optional[Dict[str, Any]] = None,
     ) -> PolicyActionBinding:
-        """Create a cryptographically bound policy-action record using canonical JSON serialization."""
-        intent_hash = hashlib.sha256(canonical_json_bytes(intent)).hexdigest()
-        policy_hash = hashlib.sha256(canonical_json_bytes(policy)).hexdigest()
-        evidence_hash = hashlib.sha256(canonical_json_bytes(evidence or {})).hexdigest()
+        """Create a cryptographically bound policy-action record using canonical JSON serialization.
+
+        Raises ``ValueError`` for an intent, policy or evidence with object keys whose JSON (string)
+        form sorts differently, and ``TypeError`` for a verdict that is not a string."""
+        if not isinstance(verdict, str):
+            raise TypeError(f"verdict must be a str, not {type(verdict).__name__}")
+        intent_hash = _json_digest(intent, "intent")
+        policy_hash = _json_digest(policy, "policy")
+        evidence_hash = _json_digest(evidence or {}, "evidence")
 
         token = None
         if verdict.upper() == "ALLOW":
@@ -78,13 +124,17 @@ class PolicyActionBinding(BaseModel):
     ) -> bool:
         """Verify that this binding cryptographically matches the given intent, policy, and evidence.
 
-        Every stored field is compared, the verdict included (``create`` stores it upper-cased)."""
-        expected = self.create(
-            intent=intent,
-            policy=policy,
-            verdict=self.control_verdict,
-            evidence=evidence,
-        )
+        Every stored field is compared, the verdict included (``create`` stores it upper-cased).
+        Inputs ``create`` refuses cannot match a binding it made, so they give False."""
+        try:
+            expected = self.create(
+                intent=intent,
+                policy=policy,
+                verdict=self.control_verdict,
+                evidence=evidence,
+            )
+        except (TypeError, ValueError):
+            return False
         return (
             self.intent_digest == expected.intent_digest
             and self.policy_snapshot_hash == expected.policy_snapshot_hash
@@ -124,10 +174,15 @@ class AgentTraceBinding(BaseModel):
         action_input: Dict[str, Any],
         observation: str,
     ) -> AgentTraceBinding:
-        """Create a cryptographically bound trace step using canonical hashing."""
-        thought_hash = hashlib.sha256(thought.encode("utf-8")).hexdigest()
-        action_hash = hashlib.sha256(canonical_json_bytes(action_input)).hexdigest()
-        obs_hash = hashlib.sha256(observation.encode("utf-8")).hexdigest()
+        """Create a cryptographically bound trace step using canonical hashing.
+
+        ``step_index`` must be an int >= 0 (not a float or bool); the texts must be str."""
+        step_index = _index(step_index, "step_index")
+        if not isinstance(tool_name, str):
+            raise TypeError(f"tool_name must be a str, not {type(tool_name).__name__}")
+        thought_hash = _text_digest(thought, "thought")
+        action_hash = _json_digest(action_input, "action_input")
+        obs_hash = _text_digest(observation, "observation")
 
         seal_raw = f"{step_index}:{thought_hash}:{tool_name}:{action_hash}:{obs_hash}"
         seal = hashlib.sha256(seal_raw.encode("utf-8")).hexdigest()
@@ -152,13 +207,16 @@ class AgentTraceBinding(BaseModel):
 
         Every stored digest, the tool name and the seal must match: a record whose fields were changed
         after sealing fails even when its seal is the one computed for the given inputs."""
-        expected = self.create(
-            step_index=self.step_index,
-            thought=thought,
-            tool_name=tool_name,
-            action_input=action_input,
-            observation=observation,
-        )
+        try:
+            expected = self.create(
+                step_index=self.step_index,
+                thought=thought,
+                tool_name=tool_name,
+                action_input=action_input,
+                observation=observation,
+            )
+        except (TypeError, ValueError):
+            return False
         return (
             self.thought_digest == expected.thought_digest
             and self.tool_name == expected.tool_name
@@ -204,17 +262,37 @@ class RAGTriadBinding(BaseModel):
         triad_harmonic_mean: float,
         passes_threshold: bool,
     ) -> RAGTriadBinding:
-        """Create a cryptographically bound RAG Triad audit record."""
-        q_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
-        a_hash = hashlib.sha256(answer.encode("utf-8")).hexdigest()
+        """Create a cryptographically bound RAG Triad audit record.
+
+        The seal covers every stored field: the three digests, the three scores and
+        ``triad_harmonic_mean`` at full precision, and ``passes_threshold``. Scores must be real
+        numbers in [0, 1] (not bool) and ``passes_threshold`` a bool."""
+        scores = [
+            _score(value, name)
+            for value, name in (
+                (context_relevance, "context_relevance"),
+                (groundedness, "groundedness"),
+                (answer_relevance, "answer_relevance"),
+                (triad_harmonic_mean, "triad_harmonic_mean"),
+            )
+        ]
+        if not isinstance(passes_threshold, bool):
+            raise TypeError("passes_threshold must be a bool")
+        if isinstance(context_passages, (str, bytes)) or not isinstance(context_passages, (list, tuple)):
+            raise TypeError("context_passages must be a list of str")
+        q_hash = _text_digest(query, "query")
+        a_hash = _text_digest(answer, "answer")
 
         # Compute Merkle root of context chunks
-        chunk_hashes = [hashlib.sha256(p.encode("utf-8")).hexdigest() for p in context_passages]
+        chunk_hashes = [_text_digest(p, "context passage") for p in context_passages]
         combined_chunks = ":".join(sorted(chunk_hashes))
         ctx_root = hashlib.sha256(combined_chunks.encode("utf-8")).hexdigest()
 
-        seal_raw = f"{q_hash}:{ctx_root}:{a_hash}:{context_relevance:.4f}:{groundedness:.4f}:{answer_relevance:.4f}:{passes_threshold}"
-        seal = hashlib.sha256(seal_raw.encode("utf-8")).hexdigest()
+        # JSON writes each float as its shortest round-trip repr, so no two distinct scores share
+        # a preimage; the domain tag keeps this from colliding with the earlier ':'-joined form.
+        seal_raw = json.dumps([q_hash, ctx_root, a_hash, *scores, passes_threshold], separators=(",", ":"))
+        seal = hashlib.sha256(_RAG_SEAL_DOMAIN + seal_raw.encode("utf-8")).hexdigest()
+        context_relevance, groundedness, answer_relevance, triad_harmonic_mean = scores
 
         return cls(
             query_digest=q_hash,
@@ -273,12 +351,19 @@ class ProofWeaveTransaction(BaseModel):
         observation_readback: str,
         timestamp_epoch_ms: Optional[int] = None,
     ) -> ProofWeaveTransaction:
+        """Seal one step. ``step_index`` and ``timestamp_epoch_ms`` must be ints >= 0 (not a float
+        or bool, which would be sealed as written and stored coerced); ``observation_readback`` a str."""
         import time
-        ts = timestamp_epoch_ms if timestamp_epoch_ms is not None else int(time.time() * 1000)
-        i_hash = hashlib.sha256(canonical_json_bytes(intent)).hexdigest()
-        p_hash = hashlib.sha256(canonical_json_bytes(policy)).hexdigest()
-        a_hash = hashlib.sha256(canonical_json_bytes(action)).hexdigest()
-        o_hash = hashlib.sha256(observation_readback.encode("utf-8")).hexdigest()
+        step_index = _index(step_index, "step_index")
+        ts = (
+            _index(timestamp_epoch_ms, "timestamp_epoch_ms")
+            if timestamp_epoch_ms is not None
+            else int(time.time() * 1000)
+        )
+        i_hash = _json_digest(intent, "intent")
+        p_hash = _json_digest(policy, "policy")
+        a_hash = _json_digest(action, "action")
+        o_hash = _text_digest(observation_readback, "observation_readback")
 
         seal_raw = f"{step_index}:{i_hash}:{p_hash}:{a_hash}:{o_hash}:{ts}"
         seal = hashlib.sha256(seal_raw.encode("utf-8")).hexdigest()
@@ -305,14 +390,17 @@ class ProofWeaveTransaction(BaseModel):
         Every stored digest and the seal must match: a transaction whose ``intent_digest`` (or any
         other digest) was changed after sealing fails even when its seal is the one computed for the
         given inputs."""
-        expected = self.create(
-            step_index=self.step_index,
-            intent=intent,
-            policy=policy,
-            action=action,
-            observation_readback=observation_readback,
-            timestamp_epoch_ms=self.timestamp_epoch_ms,
-        )
+        try:
+            expected = self.create(
+                step_index=self.step_index,
+                intent=intent,
+                policy=policy,
+                action=action,
+                observation_readback=observation_readback,
+                timestamp_epoch_ms=self.timestamp_epoch_ms,
+            )
+        except (TypeError, ValueError):
+            return False
         return (
             self.intent_digest == expected.intent_digest
             and self.policy_snapshot_hash == expected.policy_snapshot_hash
@@ -438,7 +526,8 @@ class PraxaGovernanceGovernor:
         """Evaluates agent intent against policy rules and issues a single-use authority token.
 
         The token is fresh randomness, bound to a private copy of ``intent``. Any token issued before
-        stops working. An intent whose ``action`` is not a string, or is prohibited, is REJECTED.
+        stops working. An intent that is not a dict, or whose ``action`` is missing, not a string,
+        empty or prohibited, is REJECTED: a deny-list cannot vet an action that is not named.
         Raises RuntimeError while a step is EXECUTING or EXECUTED and not yet verified."""
         candidate = _BoundIntent(intent)  # raises for an intent that is not canonical JSON
         with self._lock:
@@ -450,8 +539,8 @@ class PraxaGovernanceGovernor:
             self._token = None
             self._authorized = None
             value = candidate.value
-            action_name = value.get("action", "") if isinstance(value, dict) else None
-            if not isinstance(action_name, str) or action_name in self._prohibited:
+            action_name = value.get("action") if isinstance(value, dict) else None
+            if not isinstance(action_name, str) or not action_name or action_name in self._prohibited:
                 self._state = PraxaState.REJECTED
                 return False, None
             self._authorized = candidate
@@ -594,9 +683,25 @@ class MerkleMountainRange:
 
     @staticmethod
     def create_blinded_commitment(payload: Dict[str, Any], salt: Optional[bytes] = None) -> Tuple[str, str]:
-        """Creates a zero-knowledge salted commitment for RFC 6962 / DFARS CUI audit compliance."""
+        """Creates a zero-knowledge salted commitment for RFC 6962 / DFARS CUI audit compliance.
+
+        The commitment is ``SHA-256(canonical_json(payload) || salt)``. ``payload`` must be a dict:
+        a JSON object closes only at its last byte, so where the payload ends and the salt begins is
+        unambiguous, and no two (payload, salt) openings share a commitment. ``salt`` must be bytes
+        of at least 16 (the default is 16 fresh random bytes): a shorter one makes the commitment a
+        guessable hash of the payload. Raises ``TypeError`` or ``ValueError`` otherwise."""
         import os
-        salt_bytes = salt if salt is not None else os.urandom(16)
+        if not isinstance(payload, dict):
+            raise TypeError(f"payload must be a dict, not {type(payload).__name__}")
+        if salt is None:
+            salt_bytes = os.urandom(_MIN_COMMITMENT_SALT_BYTES)
+        elif not isinstance(salt, (bytes, bytearray, memoryview)):
+            raise TypeError(f"salt must be bytes, not {type(salt).__name__}")
+        else:
+            salt_bytes = bytes(salt)
+        if len(salt_bytes) < _MIN_COMMITMENT_SALT_BYTES:
+            raise ValueError(f"salt must be at least {_MIN_COMMITMENT_SALT_BYTES} bytes")
+        validate_json_keys(payload, "payload")
         salt_hex = salt_bytes.hex()
         canonical_bytes = canonical_json_bytes(payload)
         commitment_raw = canonical_bytes + salt_bytes

@@ -152,6 +152,8 @@ def verify_signature_ed25519(event: AuditEvent, public_key_bytes: bytes) -> bool
     if not _ED25519_SIGNATURE_HEX.fullmatch(encoded):
         return False
     sig_bytes = bytes.fromhex(encoded)
+    if not isinstance(public_key_bytes, (bytes, bytearray, memoryview)):
+        return False  # a str (a key read in text mode) is not a key: bytes(str) would raise
     public_key_bytes = bytes(public_key_bytes)
     if len(public_key_bytes) != 32 or _has_small_order(public_key_bytes) or _has_small_order(sig_bytes[:32]):
         return False
@@ -185,6 +187,8 @@ def verify_signature(event: AuditEvent, key: bytes, *, scheme: str = "hmac") -> 
     signature = event.signature
     if not signature or signature.startswith(_ED25519_PREFIX):
         return False
+    if not isinstance(key, (bytes, bytearray, memoryview)):
+        return False  # no event was signed under a str key: the writer refuses one
     try:
         expected = sign_event_hash(event.event_hash, key, hash_version=event.hash_version)
     except ValueError:  # a non-ASCII event hash was not produced by this ledger
