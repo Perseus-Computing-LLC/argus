@@ -7,6 +7,7 @@ import contextlib
 import datetime
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import math
@@ -28,7 +29,13 @@ from .hasher import (
 )
 from .models import CURRENT_HASH_VERSION, AuditEvent, ChainAnchor, ChainVerificationReport, GENESIS_PREV_HASH
 from .protocols import AuditLedgerReader, AuditLedgerWriter, AuditVerifier, LedgerCorruptionError
-from .canonical import MAX_STORED_PAYLOAD_DEPTH, validate_identifiers, validate_payload
+from .canonical import (
+    MAX_STORED_PAYLOAD_DEPTH,
+    canonical_json_bytes,
+    validate_event_id,
+    validate_identifiers,
+    validate_payload,
+)
 from .timestamps import timestamp_nanos
 
 _TAIL_BLOCK = 1 << 16
@@ -84,7 +91,8 @@ def _fsync_directory(path: str) -> None:
 
 
 def _make_directories(directory: str) -> None:
-    """Create ``directory`` and its missing parents, and flush the parent of each one created."""
+    """Create ``directory`` and its missing parents owner-only (0700), and flush the parent of each
+    one created. ``os.makedirs`` applies its mode to the last directory only, so each is made here."""
     created: List[str] = []
     probe = directory
     while not os.path.isdir(probe):
@@ -93,7 +101,12 @@ def _make_directories(directory: str) -> None:
         if parent == probe:
             break
         probe = parent
-    os.makedirs(directory, exist_ok=True)
+    for made in reversed(created):
+        try:
+            os.mkdir(made, 0o700)
+        except FileExistsError:
+            if not os.path.isdir(made):
+                raise
     for made in created:
         _fsync_directory(os.path.dirname(made))
 
@@ -142,6 +155,76 @@ def _restrict_to_owner(fd: int, path: str) -> None:
             ) from exc
 
 
+def _require_regular_file(fd: int, path: str) -> os.stat_result:
+    """``fstat`` of the descriptor, refusing anything but a regular file (a directory, a FIFO, a
+    device): such a path is not a ledger, and reading or appending to it would raise, hang, or
+    write somewhere that is not a file."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise LedgerCorruptionError(f"Ledger path {path} is not a regular file")
+    return st
+
+
+def _ledger_path(ledger_path: Any) -> str:
+    """The absolute ``str`` path of a ``str``, ``bytes`` or ``os.PathLike`` ledger path.
+
+    ``bytes`` are decoded with ``os.fsdecode``, so every name derived from the path (the torn-tail
+    sidecar) is a real path, not the ``repr`` of one. An empty path would resolve to the working
+    directory and is refused."""
+    try:
+        raw = os.fspath(ledger_path)
+    except TypeError:
+        raise TypeError(
+            f"ledger_path must be a str, bytes or os.PathLike, not {type(ledger_path).__name__}"
+        ) from None
+    text = os.fsdecode(raw)
+    if not text:
+        raise ValueError("ledger_path must not be empty")
+    if "\x00" in text:
+        raise ValueError("ledger_path must not contain a NUL byte")
+    return os.path.abspath(text)
+
+
+def _key_bytes(name: str, key: Any) -> Optional[bytes]:
+    """``bytes`` of a key given as bytes-like, ``None`` for no key; a ``str`` (a key file read in
+    text mode) or any other type is refused here rather than raising inside a verifier later."""
+    if key is None:
+        return None
+    if not isinstance(key, (bytes, bytearray, memoryview)):
+        raise TypeError(f"{name} must be bytes, not {type(key).__name__}")
+    return bytes(key)
+
+
+# Longest file name the sidecar may have (NAME_MAX on Linux and macOS).
+_MAX_NAME_BYTES = 255
+
+
+def _sidecar_path(ledger_path: str, offset: int, stamp: str) -> str:
+    """``<ledger>.torn-<offset>-<stamp>`` in the ledger's directory. When that name would exceed
+    ``_MAX_NAME_BYTES``, the ledger's own name is cut and a digest of the full name added, so a
+    long (valid) ledger name still has a sidecar its torn tail can be saved to."""
+    directory, name = os.path.split(ledger_path)
+    suffix = f".torn-{offset}-{stamp}"
+    if len(os.fsencode(name + suffix)) <= _MAX_NAME_BYTES:
+        return os.path.join(directory, name + suffix)
+    digest = "~" + hashlib.sha256(os.fsencode(name)).hexdigest()[:16]
+    budget = _MAX_NAME_BYTES - len(os.fsencode(digest + suffix))
+    prefix = name
+    while prefix and len(os.fsencode(prefix)) > budget:
+        prefix = prefix[:-1]
+    return os.path.join(directory, prefix + digest + suffix)
+
+
+# Every record either writer emits starts with these bytes (the Python model and the Rust wire
+# struct both serialise ``sequence`` first). An unterminated tail is set aside as a torn append
+# only if it is such a record cut short: bytes that are not were never a record of this package.
+_RECORD_START = b'{"sequence":'
+
+
+def _is_torn_record(fragment: bytes) -> bool:
+    return fragment.startswith(_RECORD_START) or _RECORD_START.startswith(fragment)
+
+
 class _PrefixReader(io.RawIOBase):
     """The first ``size`` bytes of the file open at ``fd``, read with ``pread``.
 
@@ -177,11 +260,13 @@ def _snapshot_lines(path: str) -> Iterator[bytes]:
     end a record at a bare CR, and would raise on a byte that is not UTF-8 instead of leaving it to the
     record parser."""
     try:
-        fd = os.open(path, os.O_RDONLY)
+        # O_NONBLOCK: opening a FIFO planted at the path must not hang the reader; it is refused below.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
         return
     reader: Optional[io.BufferedReader] = None
     try:
+        _require_regular_file(fd, path)
         fcntl.flock(fd, fcntl.LOCK_SH)
         try:
             size = os.fstat(fd).st_size
@@ -346,10 +431,17 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         ``signing_key``: that is an HMAC secret, and anyone who knows the public key could sign with it.
 
         ``require_signature=True`` refuses to open without a key. Constructing a ledger creates nothing:
-        the file and its missing directories are created owner-only (0600) by the first ``append()``, so
+        the file and its missing directories are created owner-only (0600 and 0700) by the first ``append()``, so
         a process that only reads or verifies never brings a ledger into existence. An existing file that
         group or others can access is made owner-only when the ledger is opened (best effort) and before
-        each append (or the append is refused)."""
+        each append (or the append is refused).
+
+        ``ledger_path`` is a ``str``, ``bytes`` (decoded with ``os.fsdecode``) or ``os.PathLike``, and not
+        empty. Keys are bytes; a ``str`` key is refused with ``TypeError``. ``append()`` writes only to a
+        regular file at the path itself: a symbolic link, directory, FIFO or device there is refused.
+        """
+        signing_key = _key_bytes("signing_key", signing_key)
+        verify_key = _key_bytes("verify_key", verify_key)
         if signing_key is not None and verify_key is not None:
             raise ValueError("pass signing_key (to sign) or verify_key (to check Ed25519 signatures), not both")
         if require_signature and not (signing_key or verify_key):
@@ -368,26 +460,44 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         self._ed25519_public_key = (
             ed25519_public_key(signing_key) if use_ed25519 and signing_key is not None else verify_key
         )
-        self.ledger_path = os.path.abspath(ledger_path)
+        self.ledger_path = _ledger_path(ledger_path)
         # Like the Rust FileLedger::open (which resets the mode to 0600, best effort), records already
         # in the file are kept owner-only: group/other bits are cleared, owner bits are left alone.
         # Best effort here (a verifier may open a file it does not own, or one that does not exist);
-        # append() insists.
+        # append() insists. Only a regular file at the path itself is changed: the descriptor is
+        # opened without following a symlink, so opening a ledger never changes the mode of a file
+        # a link points to, wherever that is.
         try:
-            mode = stat.S_IMODE(os.stat(self.ledger_path).st_mode)
-            if mode & _GROUP_OTHER_BITS:
-                os.chmod(self.ledger_path, mode & ~_GROUP_OTHER_BITS)
+            fd = os.open(self.ledger_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         except OSError:
-            pass
+            fd = None
+        if fd is not None:
+            try:
+                st = os.fstat(fd)
+                mode = stat.S_IMODE(st.st_mode)
+                if stat.S_ISREG(st.st_mode) and mode & _GROUP_OTHER_BITS:
+                    os.fchmod(fd, mode & ~_GROUP_OTHER_BITS)
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
 
     @staticmethod
     def load_key(path: str) -> bytes:
-        """Read a signing key from a file that only its owner can access."""
-        mode = os.stat(path).st_mode & 0o777
-        if mode & 0o077:
-            raise PermissionError(f"Key file {path} is readable by group or others (mode {mode:o}); chmod 600 it.")
-        with open(path, "rb") as fh:
-            return fh.read().strip()
+        """Read a signing key from a regular file that only its owner can access.
+
+        The bytes are returned exactly as stored: keys are raw bytes, and a random seed can begin or
+        end with a whitespace byte. The mode is checked on the opened descriptor, so it is the mode
+        of the file read, and a FIFO or device at the path is refused instead of read (or waited on)."""
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise PermissionError(f"Key file {path} is not a regular file")
+            mode = st.st_mode & 0o777
+            if mode & 0o077:
+                raise PermissionError(f"Key file {path} is readable by group or others (mode {mode:o}); chmod 600 it.")
+            return fh.read()
 
     def _open_locked_for_append(self) -> int:
         """Return a descriptor for the file now at ``ledger_path``, opened for appending and held under LOCK_EX.
@@ -401,23 +511,35 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         append to the rotated file. Group/other bits on the file are then removed, or the append refused."""
         directory = os.path.dirname(self.ledger_path)
         created = False
+        # O_NOFOLLOW: a symlink planted at the path would redirect the records (and the fchmod
+        # below) to whatever file it names. O_NONBLOCK only keeps a FIFO from blocking the open;
+        # anything but a regular file is refused once the descriptor is held.
+        flags = os.O_RDWR | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
         for _ in range(_REOPEN_ATTEMPTS):
             try:
-                fd = os.open(self.ledger_path, os.O_RDWR | os.O_APPEND | os.O_CLOEXEC)
+                fd = os.open(self.ledger_path, flags)
             except FileNotFoundError:
                 _make_directories(directory)
                 try:
-                    fd = os.open(
-                        self.ledger_path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600
-                    )
+                    fd = os.open(self.ledger_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
                 except FileExistsError:
                     continue  # another writer created it in between; open that file
                 created = True
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise LedgerCorruptionError(
+                        f"Ledger path {self.ledger_path} is a symbolic link; refusing to append through it"
+                    ) from exc
+                if exc.errno == errno.EISDIR:
+                    raise LedgerCorruptionError(f"Ledger path {self.ledger_path} is not a regular file") from exc
+                raise
             try:
+                _require_regular_file(fd, self.ledger_path)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 held = os.fstat(fd)
                 try:
-                    current = os.stat(self.ledger_path)
+                    current = os.lstat(self.ledger_path)
                 except FileNotFoundError:
                     current = None
                 if current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
@@ -441,12 +563,21 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         payload: Dict[str, Any],
         event_id: Optional[str] = None,
     ) -> AuditEvent:
-        eid = event_id or str(uuid.uuid4())
         if self._key is None and self._ed25519_public_key is not None:
             raise PermissionError("this ledger was opened with verify_key: it can check signatures but not append")
-        # Same gates as the Rust writer, before anything is locked or written.
+        # Same gates as the Rust writer, before anything is locked or written. A caller's event_id
+        # follows the actor grammar; the Rust writer always generates its own.
         validate_identifiers(event_type, actor)
+        if event_id is None:
+            eid = str(uuid.uuid4())
+        else:
+            validate_event_id(event_id)
+            eid = event_id
         validate_payload(payload)
+        # What is hashed, signed and stored is the payload as a JSON reader will see it: keys as
+        # strings (validate_payload keeps only integer keys whose order does not change), and
+        # a private copy, so the record is the one the hash covers.
+        payload = json.loads(canonical_json_bytes(payload))
 
         fd = self._open_locked_for_append()
         try:
@@ -456,6 +587,13 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
             # them has passed the tail gate; a complete record that lost only its newline is kept.
             torn_at, fragment = _unterminated_tail(fd, size)
             torn = bool(fragment.strip(_LINE_PADDING)) and not _is_record(fragment)
+            if torn and not _is_torn_record(fragment):
+                # Not the start of a record either writer emits: the file holds something other
+                # than a ledger (or was edited), and removing those bytes would destroy it.
+                raise LedgerCorruptionError(
+                    f"Cannot append to ledger: the bytes after the last newline (offset {torn_at}) are "
+                    f"not a record or the start of one; nothing was changed"
+                )
             tail = _tail_record(fd, torn_at if torn else size)
 
             last_instant: Optional[int] = None
@@ -548,11 +686,12 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         """Remove an incomplete record from the end of the file open (and exclusively locked) at ``fd``.
 
         ``fragment`` is everything after the last newline, starting at ``offset``. It is first copied
-        to ``<ledger>.torn-<offset>-<UTC time>`` (0600, fsynced) in the ledger's directory; if that copy
+        to ``<ledger>.torn-<offset>-<UTC time>`` (0600, fsynced) in the ledger's directory, the ledger's
+        name shortened if the whole would exceed NAME_MAX; if that copy
         cannot be written nothing is removed. Only ``append()`` calls this. Readers and verifiers never
         repair a file: they keep reporting the fragment as a malformed record until a writer runs."""
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        sidecar = f"{self.ledger_path}.torn-{offset}-{stamp}"
+        sidecar = _sidecar_path(self.ledger_path, offset, stamp)
         try:
             side_fd = os.open(sidecar, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
             try:
@@ -584,13 +723,15 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         )
 
     def head(self) -> Optional[AuditEvent]:
-        if not os.path.exists(self.ledger_path):
+        try:
+            fd = os.open(self.ledger_path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except FileNotFoundError:
             return None
-
-        with open(self.ledger_path, "r", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+        try:
+            _require_regular_file(fd, self.ledger_path)
+            fcntl.flock(fd, fcntl.LOCK_SH)
             try:
-                record = _tail_record(f.fileno())
+                record = _tail_record(fd)
                 if record is None:
                     return None
                 try:
@@ -600,7 +741,9 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
                         f"Malformed tail event record at line {_count_records(self.ledger_path)}: {exc}"
                     ) from exc
             finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     @property
     def head_hash(self) -> Optional[str]:
@@ -623,6 +766,8 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         return self.current_sequence
 
     def get_event(self, sequence: int) -> Optional[AuditEvent]:
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            raise TypeError("sequence must be an int")
         for event in self.iter_events():
             if event.sequence == sequence:
                 return event
@@ -715,6 +860,13 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
         )
 
     def iter_events(self, start: int = 1, end: Optional[int] = None) -> Iterator[AuditEvent]:
+        if isinstance(start, bool) or not isinstance(start, int):
+            raise TypeError("start must be an int")
+        if end is not None and (isinstance(end, bool) or not isinstance(end, int)):
+            raise TypeError("end must be an int or None")
+        return self._iter_range(start, end)
+
+    def _iter_range(self, start: int, end: Optional[int]) -> Iterator[AuditEvent]:
         for event in self._iter_records():
             if event.sequence < start:
                 continue
@@ -771,13 +923,27 @@ class AppendOnlyLedger(AuditLedgerWriter, AuditLedgerReader, AuditVerifier):
 
         # A file that is not there is not an intact empty ledger: it may have been deleted, or its
         # volume may not be mounted. Nothing is created here; the first append() creates the file.
-        if not os.path.exists(self.ledger_path):
+        # Nor is a directory, a FIFO or a device at the path: none of them holds a ledger.
+        path_error = None
+        try:
+            path_mode: Optional[int] = os.stat(self.ledger_path).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            path_mode = None
+        except OSError as exc:
+            path_mode, path_error = None, exc
+        if path_mode is None or not stat.S_ISREG(path_mode):
+            if path_error is not None:
+                detail = f"Ledger file {self.ledger_path} cannot be examined: {path_error}"
+            elif path_mode is None:
+                detail = f"Ledger file {self.ledger_path} does not exist"
+            else:
+                detail = f"Ledger path {self.ledger_path} is not a regular file"
             return ChainVerificationReport(
                 valid=False,
                 total_events=0,
                 root_hash="",
                 head_hash="",
-                error_detail=f"Ledger file {self.ledger_path} does not exist",
+                error_detail=detail,
                 checked_at=now_ts,
                 anchored=anchored,
             )

@@ -34,10 +34,12 @@ MAX_SAFE_INTEGER = 2**53 - 1
 MAX_PAYLOAD_DEPTH = 112
 MAX_STORED_PAYLOAD_DEPTH = 127
 
-_EVENT_TYPE = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)*$")
+# Applied with ``fullmatch``: with ``match``, ``$`` also matches before a final "\n", so
+# "tool.exec\n" would pass a check the Rust writer applies to every byte.
+_EVENT_TYPE = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*")
 # Printable ASCII without whitespace, quotes or backslashes: no control characters, log-line
 # injection, Unicode homoglyphs, or JSON string syntax inside an identifier.
-_ACTOR = re.compile(r"^[\x21-\x7e]+$")
+_ACTOR = re.compile(r"[\x21-\x7e]+")
 
 
 class PayloadError(ValueError):
@@ -64,18 +66,35 @@ def validate_identifiers(event_type: str, actor: str) -> None:
     anything else, so a Python-written record that Rust would not have produced is a parity
     gap, and an actor carrying JSON syntax or a newline is how one record becomes two.
     """
-    if not isinstance(event_type, str) or len(event_type) > MAX_IDENTIFIER_BYTES or not _EVENT_TYPE.match(event_type):
-        raise IdentifierError("event_type must be dot-separated [a-z0-9_-]+ segments (at most 256 bytes)")
     if (
-        not isinstance(actor, str)
-        or not actor
-        or len(actor) > MAX_IDENTIFIER_BYTES
-        or not _ACTOR.match(actor)
-        or '"' in actor
-        or "\\" in actor
+        not isinstance(event_type, str)
+        or len(event_type) > MAX_IDENTIFIER_BYTES
+        or not _EVENT_TYPE.fullmatch(event_type)
     ):
+        raise IdentifierError("event_type must be dot-separated [a-z0-9_-]+ segments (at most 256 bytes)")
+    if not _is_printable_token(actor):
         raise IdentifierError(
             "actor must be printable ASCII without whitespace, quotes or backslashes (1-256 bytes)"
+        )
+
+
+def _is_printable_token(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= MAX_IDENTIFIER_BYTES
+        and _ACTOR.fullmatch(value) is not None
+        and '"' not in value
+        and "\\" not in value
+    )
+
+
+def validate_event_id(event_id: str) -> None:
+    """Apply the ``actor`` grammar to a caller-supplied ``event_id``: printable ASCII without
+    whitespace, ``"`` or ``\\``, 1-256 bytes. UUIDs and ULIDs fit; control characters, log-line
+    injection and an identifier larger than the cap do not."""
+    if not _is_printable_token(event_id):
+        raise IdentifierError(
+            "event_id must be printable ASCII without whitespace, quotes or backslashes (1-256 bytes)"
         )
 
 
@@ -141,6 +160,21 @@ def validate_payload(obj: Any, path: str = "payload") -> None:
     _check_values(obj, path)
     if path == "payload" and len(canonical_json_bytes(obj)) > MAX_PAYLOAD_BYTES:
         raise PayloadError(f"payload exceeds {MAX_PAYLOAD_BYTES} canonical bytes")
+
+
+def validate_json_keys(obj: Any, path: str = "value") -> None:
+    """Refuse object keys, at any depth, whose stored JSON form would not hash back to the digest
+    computed from ``obj`` (the rule of ``_check_keys``). Values are not checked: this is the gate
+    for digests that are only ever recomputed in Python, such as the ProofWeave bindings."""
+    canonical_json_bytes(obj)  # refuses cycles and values JSON cannot encode before the walk below
+    stack = [(obj, path)]
+    while stack:
+        value, where = stack.pop()
+        if isinstance(value, dict):
+            _check_keys(value, where)
+            stack.extend((v, f"{where}.{k}") for k, v in value.items())
+        elif isinstance(value, (list, tuple)):
+            stack.extend((v, f"{where}[{i}]") for i, v in enumerate(value))
 
 
 #: Former name of :func:`validate_payload`, kept for callers that imported it.
